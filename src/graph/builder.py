@@ -6,6 +6,7 @@ from .nodes import (
     supervisor_node,
     researcher_node,
     analyst_node,
+    planner_node,
     reviewer_node,
     generate_response_node,
     memory_compressor_node,
@@ -21,14 +22,14 @@ def build_graph(checkpointer=None):
           │
     load_context
           │
-    supervisor ──────────────────────────────┐
-      │         │          │                 │
-    researcher analyst  reviewer   generate_response
-      │         │          │                 │
-      └─────────┴──────────┘                 │
-          │                          memory_compressor
-          ▼                                  │
-    supervisor (循环)                        END
+    supervisor ──────────────────────────────────────────┐
+      │         │          │          │                  │
+    researcher analyst  planner   reviewer   generate_response
+      │         │          │          │                  │
+      └─────────┴──────────┴──────────┘                  │
+          │                                      memory_compressor
+          ▼                                              │
+    supervisor (循环)                                    END
     """
     graph = StateGraph(AgentState)
 
@@ -37,6 +38,7 @@ def build_graph(checkpointer=None):
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("researcher", researcher_node)
     graph.add_node("analyst", analyst_node)
+    graph.add_node("planner", planner_node)
     graph.add_node("reviewer", reviewer_node)
     graph.add_node("generate_response", generate_response_node)
     graph.add_node("memory_compressor", memory_compressor_node)
@@ -52,6 +54,7 @@ def build_graph(checkpointer=None):
         {
             "researcher": "researcher",
             "analyst": "analyst",
+            "planner": "planner",
             "reviewer": "reviewer",
             "generate_response": "generate_response",
         },
@@ -60,6 +63,7 @@ def build_graph(checkpointer=None):
     # 每个子 agent 完成后 → 回到 supervisor 继续调度
     graph.add_edge("researcher", "supervisor")
     graph.add_edge("analyst", "supervisor")
+    graph.add_edge("planner", "supervisor")
     graph.add_edge("reviewer", "supervisor")
 
     # generate_response → 压缩检查或结束

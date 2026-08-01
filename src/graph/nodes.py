@@ -1,9 +1,11 @@
 import os
 import json
 import re
+import hashlib
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
+from langgraph.types import interrupt
 from .state import AgentState
 
 from ..tools.web_search import web_search
@@ -12,106 +14,37 @@ from ..tools.calculator import calculator
 from ..tools.python_executor import python_executor
 from ..tools.file_rag import search_chunks
 from ..memory.compressor import generate_summary
-from ..memory.store import save_summary
+from ..memory.store import save_summary, get_latest_plan
 from ..preferences.manager import get_preferences
 from ..preferences.prompt_builder import build_preference_prompt
 
-MAX_CONTEXT_MESSAGES = 20
-COMPRESSION_THRESHOLD = 20
-MAX_TOOL_ITERATIONS = 3
+from .prompts import (
+    MAX_CONTEXT_MESSAGES,
+    COMPRESSION_THRESHOLD,
+    MAX_TOOL_ITERATIONS,
+    TOOL_AGENT_MAP,
+    RESEARCHER_PROMPT,
+    ANALYST_PROMPT,
+    PLANNER_PROMPT,
+)
+from .context import (
+    get_recent_messages,
+    build_supervisor_context,
+    build_reviewer_context,
+    build_planner_context,
+    build_generate_context,
+)
 
-# 工具 → agent 映射，用于 supervisor 调度约束
-TOOL_AGENT_MAP: dict[str, str] = {
-    "web_search": "researcher",
-    "aminer_search_papers": "researcher",
-    "python_executor": "analyst",
-    "calculator": "analyst",
-}
 
-
-def get_llm() -> ChatOpenAI:
+def get_llm(streaming: bool = False) -> ChatOpenAI:
     return ChatOpenAI(
         model=os.getenv("LLM_MODEL", "deepseek-chat"),
         api_key=os.getenv("OPENAI_API_KEY", "sk-xxx"),
         base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
         temperature=0.7,
-        streaming=True,
+        streaming=streaming,
+        request_timeout=int(os.getenv("LLM_TIMEOUT", "120")),
     )
-
-
-# ============================================================
-# System Prompts
-# ============================================================
-
-SUPERVISOR_PROMPT = """你是一个科研任务调度者（Supervisor）。根据用户的问题和已有的专家分析结果，决定接下来调用哪个专家代理，或者结束调度。
-
-可调用的专家代理：
-- researcher: 文献检索与信息收集专家（搜索最新论文、资料、从上传文档中检索内容）
-- analyst: 数据分析与计算专家（数学计算、统计检验、数据对比）
-- reviewer: 学术评审专家（对已有结论进行批判性评估，发现方法论漏洞、样本偏差、逻辑问题）
-
-调度逻辑：
-- 用户问题需要搜索最新信息或文献 → 先调用 researcher
-- 用户问题涉及计算或数据分析 → 调用 analyst
-- researcher 已返回搜索结果，需要评估其质量和局限性 → 调用 reviewer
-- 所有必要信息已收集完毕 → FINISH
-- 可以按顺序调用多个代理（例如先 researcher 再 reviewer）
-- 如果提示中包含"用户指定的工具要求"，必须调用对应的 agent，不得跳过
-
-**重要：必须输出严格的 JSON 格式，不要添加任何其他文字。**
-{"next": "<researcher|analyst|reviewer|FINISH>", "reason": "<一句话说明>"}"""
-
-RESEARCHER_PROMPT = """你是一个文献检索与信息收集专家。你的职责是搜索、收集、整理与用户问题相关的信息和文献。
-
-你可以使用以下工具：
-- web_search: 搜索互联网上的最新资讯、行业动态、博客、技术文章
-- aminer_search_papers: 搜索正式发表的学术论文（中英文），适合查找研究论文、文献综述
-- search_uploaded_docs: 搜索用户已上传的 PDF/Word 文档内容。当用户提到「我上传的文件」「这篇论文」「文档里」时使用
-
-使用规则：
-- 用户问「论文」「研究」「文献」→ 优先用 aminer_search_papers
-- 用户问「最新消息」「新闻」「行业动态」→ 用 web_search
-- 用户提到上传的文档或文件内容 → 用 search_uploaded_docs
-- 如果一次搜索不够全面，尝试不同的搜索词
-- 如实汇报每个结果的来源、标题、摘要
-- 用中文整理和总结搜索结果
-- 不要对结果进行批判性评估（这由 reviewer 负责）
-- 如果没有找到相关信息，如实告知"""
-
-ANALYST_PROMPT = """你是一个数据分析与计算专家。你的职责是进行数学计算、统计分析和数据可视化。
-
-- 使用 calculator 工具进行数学计算
-- 使用 python_executor 工具进行数据分析、统计检验、画图（matplotlib/seaborn）
-- 画图时用 plt.savefig() 保存图片，不要用 plt.show()
-- 对数据进行分析和对比
-- 如果需要统计检验，说明该用什么方法以及为什么
-- 用中文清晰地呈现计算过程和分析结果
-- 只做计算和分析，不下结论（结论由综合回答生成）"""
-
-REVIEWER_PROMPT = """你是一个学术评审专家。你的职责是对已有的检索结果和结论进行严格的批判性评估。
-
-请从以下维度审视已有的信息：
-1. **方法论评估**：研究方法是否合理？有没有明显的缺陷？
-2. **样本与数据**：样本量是否足够？数据来源是否可靠？
-3. **结论有效性**：结论是否被数据充分支持？是否存在过度推广？
-4. **替代解释**：是否有其他的解释或替代假设未被考虑？
-5. **局限性**：这个研究或信息的局限性在哪里？
-6. **冲突观点**：是否存在与这些发现相矛盾的观点或证据？
-
-- 用中文清晰列出你的评估
-- 不要因为想保持友好而回避尖锐的批评
-- 指出问题时，同时说明为什么这是个问题
-- 如果信息不足以进行评估，明确指出哪些信息缺失"""
-
-GENERATE_PROMPT = """你是一个专业的科研助手。请综合以下所有专家的分析结果，给用户提供最终的回答。
-
-回答要求：
-- 使用 Markdown 格式，结构清晰
-- 先给出核心结论，再展开细节
-- 如果 reviewer 提出了批判性意见，必须在回答中明确提及方法论局限或注意事项
-- 引用具体的数据和来源
-- 区分「已确认的结论」和「需要进一步验证的观点」
-- 用中文回复，保持专业、准确、简洁的风格"""
 
 
 # ============================================================
@@ -141,6 +74,12 @@ async def load_context_node(state: AgentState) -> dict:
     if prefs_text:
         context_parts.append(prefs_text)
 
+    latest_plan = get_latest_plan(project_id)
+    if latest_plan:
+        plan_prefix = "自定义" if latest_plan.get("is_custom") else "已选定"
+        plan_info = f"## 当前项目的研究方案\n{plan_prefix}方案：{latest_plan.get('plan_title', '')}\n{latest_plan.get('plan_detail', '')}"
+        context_parts.append(plan_info)
+
     return {
         "system_prompt": "\n\n".join(context_parts),
         "retrieved_docs": [],
@@ -150,16 +89,24 @@ async def load_context_node(state: AgentState) -> dict:
 async def supervisor_node(state: AgentState) -> dict:
     """调度者节点：决定接下来调用哪个子 agent，或者结束调度。"""
     log = state.get("supervisor_log", [])
+    agent_outputs = state.get("agent_outputs", {})
 
-    # 防止无限循环：最多调度 5 次
+    # 防止无限循环：最多调度 3 次（2 次 agent + 1 次 FINISH）
     if len(log) >= 5:
         return {
             "next_agent": "FINISH",
             "supervisor_log": log + [{"next": "FINISH", "reason": "达到最大调度次数"}],
         }
 
+    # planner 已完成方案设计，不允许再次调用，直接结束调度
+    if "planner" in agent_outputs:
+        return {
+            "next_agent": "FINISH",
+            "supervisor_log": log + [{"next": "FINISH", "reason": "planner 已完成方案设计，结束调度"}],
+        }
+
     llm = get_llm()
-    msgs = _build_supervisor_messages(state)
+    msgs = build_supervisor_context(state)
     response = await llm.ainvoke(msgs)
     decision = _parse_decision(response.content)
 
@@ -177,7 +124,7 @@ async def supervisor_node(state: AgentState) -> dict:
 async def researcher_node(state: AgentState) -> dict:
     """文献检索 agent：动态组装工具（全局工具 + 项目级 RAG 工具）。"""
     llm = get_llm()
-    user_msgs = _get_recent_user_messages(state)
+    user_msgs = get_recent_messages(state)
     context = state.get("system_prompt", "")
 
     project_id = state["project_id"]
@@ -187,24 +134,29 @@ async def researcher_node(state: AgentState) -> dict:
     if context:
         full_prompt += f"\n\n## 上下文信息\n{context}"
 
-    content = await _run_tool_loop(llm, full_prompt, user_msgs, tools)
+    content, ref_sources = await _run_tool_loop(llm, full_prompt, user_msgs, tools)
 
     return {
         "agent_outputs": {**state.get("agent_outputs", {}), "researcher": content},
+        "reference_sources": ref_sources,
     }
 
 
 async def analyst_node(state: AgentState) -> dict:
-    """数据分析 agent：自带 calculator 工具循环。"""
+    """数据分析 agent：自带 calculator 工具循环，可基于检索结果进行计算分析。"""
     llm = get_llm()
-    user_msgs = _get_recent_user_messages(state)
+    user_msgs = get_recent_messages(state)
 
     full_prompt = ANALYST_PROMPT
     context = state.get("system_prompt", "")
     if context:
         full_prompt += f"\n\n## 上下文信息\n{context}"
 
-    content = await _run_tool_loop(llm, full_prompt, user_msgs, ANALYST_TOOLS)
+    researcher_output = state.get("agent_outputs", {}).get("researcher", "")
+    if researcher_output:
+        full_prompt += f"\n\n## 文献检索结果（可作为分析依据）\n{researcher_output}"
+
+    content, _ = await _run_tool_loop(llm, full_prompt, user_msgs, ANALYST_TOOLS)
 
     return {
         "agent_outputs": {**state.get("agent_outputs", {}), "analyst": content},
@@ -214,7 +166,7 @@ async def analyst_node(state: AgentState) -> dict:
 async def reviewer_node(state: AgentState) -> dict:
     """学术评审 agent：无工具，纯推理批判性评估。"""
     llm = get_llm()
-    msgs = _build_reviewer_messages(state)
+    msgs = build_reviewer_context(state)
     response = await llm.ainvoke(msgs)
 
     return {
@@ -222,10 +174,55 @@ async def reviewer_node(state: AgentState) -> dict:
     }
 
 
+async def planner_node(state: AgentState) -> dict:
+    """研究方案设计 agent：生成候选方案，通过 interrupt() 暂停等待用户选择。"""
+    llm = get_llm()
+    msgs = build_planner_context(state)
+    response = await llm.ainvoke(msgs)
+    plan_options = _parse_plan_options(response.content)
+
+    # 暂停图执行，将候选方案抛给前端
+    user_choice = interrupt({
+        "type": "plan_options",
+        "options": plan_options,
+    })
+    # ─── 图在此暂停，用户选择后通过 /chat/resume 恢复 ───
+
+    # 解析用户选择：可能是预制方案 ID 或自定义文本
+    chosen_plan_id = ""
+    custom_plan_text = ""
+    plan_summary = ""
+
+    if isinstance(user_choice, dict):
+        chosen_plan_id = user_choice.get("chosen_plan_id", "")
+        custom_plan_text = user_choice.get("custom_plan_text", "")
+
+    if chosen_plan_id:
+        # 从 plan_options 中找到用户选中的方案
+        for opt in plan_options:
+            if opt.get("id") == chosen_plan_id:
+                plan_summary = (
+                    f"用户选择了方案 {chosen_plan_id}：「{opt.get('title', '')}」\n"
+                    f"思路：{opt.get('description', '')}\n"
+                    f"优势：{'、'.join(opt.get('pros', []))}\n"
+                    f"风险：{'、'.join(opt.get('cons', []))}"
+                )
+                break
+    elif custom_plan_text:
+        plan_summary = f"用户自定义方案：\n{custom_plan_text}"
+
+    return {
+        "agent_outputs": {**state.get("agent_outputs", {}), "planner": plan_summary},
+        "plan_options": plan_options,
+        "chosen_plan_id": chosen_plan_id,
+        "custom_plan_text": custom_plan_text,
+    }
+
+
 async def generate_response_node(state: AgentState) -> dict:
     """综合所有 agent 输出，生成最终用户回复。"""
-    llm = get_llm()
-    msgs = _build_generate_messages(state)
+    llm = get_llm(streaming=True)
+    msgs = build_generate_context(state)
     response = await llm.ainvoke(msgs)
 
     return {"messages": [response]}
@@ -320,130 +317,78 @@ def _format_rag_context(docs: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-def _get_recent_user_messages(state: AgentState) -> list:
-    """获取最近的用户对话消息（不含 system message）。"""
-    all_messages = list(state["messages"])
-    conv_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
-    return conv_msgs[-MAX_CONTEXT_MESSAGES:]
-
-
-def _build_supervisor_messages(state: AgentState) -> list:
-    """构建 supervisor 的消息列表：系统提示 + 上下文 + 对话 + agent 输出摘要。"""
-    all_messages = list(state["messages"])
-    conv_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
-    recent = conv_msgs[-MAX_CONTEXT_MESSAGES:]
-
-    # 添加上下文
-    context = state.get("system_prompt", "")
-    prompt = SUPERVISOR_PROMPT
-    if context:
-        prompt += f"\n\n## 当前上下文\n{context}"
-
-    # 用户指定的工具约束
-    required_tools = state.get("required_tools", [])
-    if required_tools:
-        required_agents = set()
-        tool_lines = []
-        for tool_name in required_tools:
-            agent = TOOL_AGENT_MAP.get(tool_name)
-            if agent:
-                required_agents.add(agent)
-                tool_lines.append(f"- {tool_name} → 由 **{agent}** 提供")
-        if required_agents:
-            prompt += (
-                "\n\n## 用户指定的工具要求（必须遵守）\n"
-                "用户本次明确要求使用以下工具，你**必须**调用对应的 agent：\n"
-                + "\n".join(tool_lines) +
-                "\n\n如果多个 agent 都需要调用，请按合理顺序安排。"
-                "在调用完所有要求的 agent 之前，不能 FINISH。"
-            )
-
-    msgs = [SystemMessage(content=prompt)] + recent
-
-    # 如果已有 agent 输出，加入提示
-    agent_outputs = state.get("agent_outputs", {})
-    if agent_outputs:
-        summary_lines = ["## 已完成的专家分析"]
-        for name, output in agent_outputs.items():
-            summary_lines.append(f"### {name}\n{output[:800]}...")  # 截断避免超长
-        msgs.append(AIMessage(content="\n\n".join(summary_lines)))
-
-    # supervisor 调用记录
-    log = state.get("supervisor_log", [])
-    if log:
-        history = "## 之前的调度记录\n" + "\n".join(
-            f"- 调用了 {entry['next']}: {entry['reason']}" for entry in log
+def _parse_tool_source(tool_name: str, output_text: str) -> list[dict]:
+    """从原始工具输出中解析结构化来源信息。返回 [{id, title, url, summary, source_type}, ...]"""
+    sources: list[dict] = []
+    if tool_name == "web_search":
+        pattern = re.compile(
+            r'(\d+)\.\s*(.+?)\n\s+来源:\s*(.+?)\s*\|\s*URL:\s*(.+?)\n\s+(.+?)(?=\n\n\d+\.|\n\d+\.|\Z)',
+            re.DOTALL,
         )
-        msgs.append(AIMessage(content=history))
-
-    return msgs
-
-
-def _build_reviewer_messages(state: AgentState) -> list:
-    """构建 reviewer 的消息列表：系统提示 + 原始问题 + researcher 输出。"""
-    all_messages = list(state["messages"])
-    conv_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
-    recent = conv_msgs[-MAX_CONTEXT_MESSAGES:]
-
-    # reviewer 需要看原始问题和 researcher 的输出
-    researcher_output = state.get("agent_outputs", {}).get("researcher", "")
-
-    msgs = [SystemMessage(content=REVIEWER_PROMPT)]
-
-    # 添加原始用户问题
-    user_questions = [m for m in recent if hasattr(m, "type") and m.type == "human"]
-    if user_questions:
-        msgs.append(SystemMessage(content=f"## 用户的原始问题\n{user_questions[-1].content}"))
-
-    # 添加 researcher 和其他 agent 的输出
-    if researcher_output:
-        msgs.append(SystemMessage(content=f"## 文献检索结果（需要你评估）\n{researcher_output}"))
-
-    # 也加入 analyst 输出（如果有）
-    analyst_output = state.get("agent_outputs", {}).get("analyst", "")
-    if analyst_output:
-        msgs.append(SystemMessage(content=f"## 数据分析结果\n{analyst_output}"))
-
-    return msgs
-
-
-def _build_generate_messages(state: AgentState) -> list:
-    """构建 generate_response 的消息列表：综合所有 agent 输出 + 原始问题。"""
-    all_messages = list(state["messages"])
-    conv_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
-    recent = conv_msgs[-MAX_CONTEXT_MESSAGES:]
-
-    # 找到用户原始问题
-    user_questions = [m for m in recent if hasattr(m, "type") and m.type == "human"]
-    user_question = user_questions[-1].content if user_questions else ""
-
-    # 收集所有 agent 输出
-    agent_outputs = state.get("agent_outputs", {})
-
-    parts = [GENERATE_PROMPT]
-    parts.append(f"## 用户的原始问题\n{user_question}")
-
-    if agent_outputs.get("researcher"):
-        parts.append(f"## 文献检索结果\n{agent_outputs['researcher']}")
-    if agent_outputs.get("analyst"):
-        parts.append(f"## 数据分析结果\n{agent_outputs['analyst']}")
-    if agent_outputs.get("reviewer"):
-        parts.append(f"## 学术评审意见\n{agent_outputs['reviewer']}")
-
-    context = state.get("system_prompt", "")
-    if context:
-        parts.append(f"## 其他上下文\n{context}")
-
-    return [SystemMessage(content="\n\n".join(parts))]
+        for m in pattern.finditer(output_text):
+            url = m.group(4).strip()
+            title = m.group(2).strip()
+            sid = hashlib.md5(f"{url}|{title}".encode()).hexdigest()[:12]
+            sources.append({
+                "id": sid, "title": title, "url": url,
+                "summary": m.group(5).strip()[:300], "source_type": "web",
+            })
+    elif tool_name == "aminer_search_papers":
+        pattern = re.compile(
+            r'(\d+)\.\s+\*\*(.+?)\*\*\n((?:(?!\n\d+\.\s).)*)',
+            re.DOTALL,
+        )
+        for m in pattern.finditer(output_text):
+            title = m.group(2).strip()
+            meta = m.group(3)
+            doi_match = re.search(r'DOI:\s*(\S+)', meta)
+            url = f"https://doi.org/{doi_match.group(1).strip()}" if doi_match else ""
+            sid = hashlib.md5(f"{url}|{title}".encode()).hexdigest()[:12]
+            sources.append({
+                "id": sid, "title": title, "url": url,
+                "summary": meta.strip()[:300], "source_type": "paper",
+            })
+    elif tool_name == "search_uploaded_docs":
+        pattern = re.compile(r'\[(\d+)\]\s*来源:\s*(.+?)\n(.+?)(?=\[\d+\]|\Z)', re.DOTALL)
+        for m in pattern.finditer(output_text):
+            title = m.group(2).strip()
+            sid = hashlib.md5(title.encode()).hexdigest()[:12]
+            sources.append({
+                "id": sid, "title": title, "url": "",
+                "summary": m.group(3).strip()[:300], "source_type": "document",
+            })
+    return sources
 
 
-async def _run_tool_loop(llm, system_prompt: str, user_msgs: list, tools: list) -> str:
-    """在 agent 内部执行工具调用循环，返回最终文本输出。"""
+def _parse_plan_options(text: str) -> list[dict]:
+    """从 LLM 回复中解析候选方案 JSON 数组。解析失败时返回默认方案。"""
+    # 尝试匹配 JSON 数组
+    match = re.search(r'\[\s*\{.*\}\s*\]', text, re.DOTALL)
+    if match:
+        try:
+            options = json.loads(match.group())
+            if isinstance(options, list) and len(options) > 0:
+                return options
+        except json.JSONDecodeError:
+            pass
+    # 回退：生成一个默认方案
+    return [
+        {
+            "id": "plan_default",
+            "title": "综合方案",
+            "description": "基于已有信息的综合研究方案",
+            "pros": ["全面覆盖已有信息", "风险较低"],
+            "cons": ["缺乏针对性", "创新性有限"],
+        }
+    ]
+
+
+async def _run_tool_loop(llm, system_prompt: str, user_msgs: list, tools: list) -> tuple[str, list[dict]]:
+    """在 agent 内部执行工具调用循环，返回 (最终文本输出, 从工具输出中解析的来源列表)。"""
     if not tools:
-        # 无工具 agent，直接调用
         msgs = [SystemMessage(content=system_prompt)] + user_msgs
         response = await llm.ainvoke(msgs)
-        return response.content
+        return response.content, []
 
     llm_with_tools = llm.bind_tools(tools)
     msgs = [SystemMessage(content=system_prompt)] + user_msgs
@@ -451,9 +396,13 @@ async def _run_tool_loop(llm, system_prompt: str, user_msgs: list, tools: list) 
     response = await llm_with_tools.ainvoke(msgs)
     iterations = 0
 
+    all_sources: list[dict] = []
+    seen_ids: set[str] = set()
+    source_counter = 0
+
     while response.tool_calls and iterations < MAX_TOOL_ITERATIONS:
         tool_msgs = []
-        for tc in response.tool_calls:
+        for tc in response.tool_calls[:3]:
             tool_name = tc.get("name", "")
             tool_args = tc.get("args", {})
             tool_id = tc.get("id", "")
@@ -469,8 +418,18 @@ async def _run_tool_loop(llm, system_prompt: str, user_msgs: list, tools: list) 
 
             tool_msgs.append(ToolMessage(content=result, tool_call_id=tool_id))
 
+            # 从原始工具输出中解析来源，分配全局编号（与 server.py 一致的顺序）
+            if tool_name in ("web_search", "aminer_search_papers", "search_uploaded_docs"):
+                parsed = _parse_tool_source(tool_name, result)
+                for s in parsed:
+                    if s["id"] not in seen_ids:
+                        seen_ids.add(s["id"])
+                        source_counter += 1
+                        s["source_number"] = source_counter
+                        all_sources.append(s)
+
         msgs = msgs + [response] + tool_msgs
         response = await llm_with_tools.ainvoke(msgs)
         iterations += 1
 
-    return response.content
+    return response.content, all_sources

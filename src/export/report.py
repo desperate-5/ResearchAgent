@@ -3,55 +3,37 @@ from datetime import datetime, timezone
 
 from langchain_openai import ChatOpenAI
 
-from ..memory.store import get_history, get_summary
+from ..memory.store import get_history, get_summary, get_project_sources, get_latest_plan
 from ..projects.manager import get_project
 
 
-REPORT_SYSTEM_PROMPT = """你是一个科研报告生成助手。根据用户提供的对话历史，生成一份结构化的 Markdown 研究报告。
+REPORT_SYSTEM_PROMPT = """你是一个学术写作专家。你的任务是基于已有的研究资料，撰写一篇高质量、结构化的中文学术文章。
 
-报告必须使用中文，严格按以下四个章节组织：
-
-## 一、研究脉络
-- 按时间顺序梳理本次研究中讨论的主题演变
-- 说明各阶段的研究重点和转折点
-- 突出关键的研究思路推进
-
-## 二、已确认结论
-- 列出对话中已经明确的结论和发现
-- 每条结论用要点列出，注明依据来源
-- 区分"高置信度"和"中等置信度"
-
-## 三、待解决问题
-- 列出尚未解决或需要进一步研究的问题
-- 说明每个问题的难度和优先级
-- 如有可能，给出建议的研究方向
-
-## 四、引用来源
-- 汇总对话中提及的论文、文章、数据来源
-- 尽可能给出完整信息（标题、作者、年份、链接）
-- 标注每个来源与哪个结论相关
-
-要求：
-- 基于对话内容，不要编造不存在的信息
-- 格式整洁，使用 Markdown 标题、列表、表格
-- 如果对话中某部分内容不足，请注明"暂无足够信息"而不是编造"""
+写作要求：
+- 使用中文撰写，学术风格，专业、严谨、简洁
+- 结构清晰：摘要 → 引言 → 相关研究 → 技术方案 → 分析与讨论 → 结论 → 参考文献
+- 基于提供的资料内容，不要编造不存在的数据或结论
+- 对于资料中不充分的部分，用「[需要进一步调研]」标注
+- 使用 Markdown 格式，合理使用标题、列表、表格
+- 文中引用时用 [N] 标注，与参考文献列表对应
+- 如果提供了研究方案，要围绕方案展开论述"""
 
 
 async def generate_report(project_id: str) -> str:
-    """从对话历史生成结构化 Markdown 研究报告。"""
+    """从对话历史 + 来源 + 方案生成结构化 Markdown 学术文章。"""
     project = get_project(project_id)
     project_name = project["name"] if project else "未知项目"
 
     history = get_history(project_id)
     summary = get_summary(project_id)
+    sources = get_project_sources(project_id)
+    latest_plan = get_latest_plan(project_id)
 
-    # 将对话格式化为可读文本
     transcript = _format_transcript(history)
 
     if not transcript.strip():
         return _empty_report(project_name)
 
-    # 调用 LLM 生成报告
     llm = ChatOpenAI(
         model=os.getenv("LLM_MODEL", "deepseek-chat"),
         api_key=os.getenv("OPENAI_API_KEY", "sk-xxx"),
@@ -59,16 +41,29 @@ async def generate_report(project_id: str) -> str:
         temperature=0.3,
     )
 
-    user_prompt = f"""## 项目名称
-{project_name}
+    user_prompt_parts = [f"## 项目名称\n{project_name}"]
 
-## 历史对话摘要
-{summary if summary else "暂无"}
+    if summary:
+        user_prompt_parts.append(f"## 历史对话摘要\n{summary}")
 
-## 完整对话记录
-{transcript}
+    if latest_plan:
+        plan_prefix = "自定义" if latest_plan.get("is_custom") else "已选定"
+        user_prompt_parts.append(
+            f"## 当前研究方案\n{plan_prefix}方案：{latest_plan.get('plan_title', '')}\n{latest_plan.get('plan_detail', '')}"
+        )
 
-请基于以上对话内容生成研究报告。"""
+    if sources:
+        src_lines = []
+        for s in sources:
+            sn = s.get("source_number", "?")
+            src_lines.append(f"[{sn}] {s.get('title', '')} - {s.get('url', '')}")
+        if src_lines:
+            user_prompt_parts.append(f"## 参考文献来源\n" + "\n".join(src_lines))
+
+    user_prompt_parts.append(f"## 完整对话记录\n{transcript}")
+    user_prompt_parts.append("请基于以上资料撰写学术文章。")
+
+    user_prompt = "\n\n".join(user_prompt_parts)
 
     try:
         response = await llm.ainvoke([
@@ -83,7 +78,7 @@ async def generate_report(project_id: str) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     total_messages = len(history)
 
-    header = f"""# 研究报告：{project_name}
+    header = f"""# 学术文章：{project_name}
 
 > 生成时间：{now} | 对话轮次：{total_messages} 条 | 摘要状态：{"已有" if summary else "暂无"}
 
@@ -111,25 +106,37 @@ def _format_transcript(history: list[dict]) -> str:
 
 def _empty_report(project_name: str) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    return f"""# 研究报告：{project_name}
+    return f"""# 学术文章：{project_name}
 
 > 生成时间：{now} | 状态：空项目
 
 ---
 
-## 一、研究脉络
+## 摘要
 
-暂无对话记录，无法梳理研究脉络。
+暂无对话记录，无法生成学术文章。
 
-## 二、已确认结论
-
-暂无足够信息。
-
-## 三、待解决问题
+## 引言
 
 暂无足够信息。
 
-## 四、引用来源
+## 相关研究
+
+暂无足够信息。
+
+## 技术方案
+
+暂无足够信息。
+
+## 分析与讨论
+
+暂无足够信息。
+
+## 结论
+
+暂无足够信息。
+
+## 参考文献
 
 暂无引用来源。
 """
@@ -139,29 +146,40 @@ def _fallback_report(project_name: str, history: list[dict], summary: str) -> st
     """LLM 调用失败时的模板化回退报告。"""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # 统计基本信息
     user_msgs = [m for m in history if m["role"] == "user"]
     assistant_msgs = [m for m in history if m["role"] == "assistant"]
 
-    return f"""# 研究报告：{project_name}
+    return f"""# 学术文章：{project_name}
 
 > 生成时间：{now} | 模式：基础报告（LLM 生成失败，使用模板）
 
 ---
 
-## 一、研究脉络
+## 摘要
 
-{_extract_timeline(history)}
+{summary if summary else "暂无摘要。"}
 
-## 二、已确认结论
-
-{_extract_conclusions(assistant_msgs) if assistant_msgs else "暂无足够信息。"}
-
-## 三、待解决问题
+## 引言
 
 {_extract_questions(user_msgs) if user_msgs else "暂无足够信息。"}
 
-## 四、引用来源
+## 相关研究
+
+{_extract_conclusions(assistant_msgs) if assistant_msgs else "暂无足够信息。"}
+
+## 技术方案
+
+{_extract_timeline(history)}
+
+## 分析与讨论
+
+暂无足够信息（模板模式无法自动生成分析内容，请查看原始对话记录）。
+
+## 结论
+
+暂无足够信息（模板模式无法自动生成结论，请查看原始对话记录）。
+
+## 参考文献
 
 暂无足够信息（模板模式无法自动提取引用，请查看原始对话记录）。
 """

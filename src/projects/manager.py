@@ -43,6 +43,18 @@ def delete_project(project_id: str) -> bool:
     return True
 
 
+def rename_project(project_id: str, new_name: str) -> dict | None:
+    conn = _get_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
+        (new_name, now, project_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_project(project_id)
+
+
 def update_timestamp(project_id: str):
     conn = _get_conn()
     now = datetime.now(timezone.utc).isoformat()

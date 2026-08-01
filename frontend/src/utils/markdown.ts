@@ -58,6 +58,12 @@ export function renderMarkdown(text: string): string {
     return `<table>${thead}${tbody}</table>`;
   });
 
+  // 引用标记: [1], [2,3], [1,3,5] → 可点击上标（仅处理未被 HTML 包裹的纯文本位置）
+  html = html.replace(
+    /\[(\d+(?:[,\s]*\d+)*)\]/g,
+    '<sup class="citation-marker" data-source-num="$1">[$1]</sup>'
+  );
+
   // 段落：连续的换行分隔
   const blocks = html.split(/\n\n+/);
   html = blocks

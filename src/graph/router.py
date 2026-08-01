@@ -9,7 +9,7 @@ def route_from_supervisor(state: AgentState) -> str:
     next_agent = state.get("next_agent", "FINISH")
     if next_agent == "FINISH":
         return "generate_response"
-    if next_agent in ("researcher", "analyst", "reviewer"):
+    if next_agent in ("researcher", "analyst", "planner", "reviewer"):
         return next_agent
     # 无法识别的目标，回退
     return "generate_response"

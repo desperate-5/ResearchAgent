@@ -24,11 +24,30 @@ export interface PreferencesConfig {
 
 // ---- SSE stream event types ----
 
+export interface SourceItem {
+  id: string;
+  title: string;
+  url: string;
+  summary: string;
+  source_type: "web" | "paper" | "document";
+  source_number: number;
+}
+
 export type SSEEvent =
   | { type: "response"; content: string }
   | { type: "tool_call"; tool: string; status: "start" | "end" }
   | { type: "agent_phase"; agent: string; status: "start" | "end" }
+  | { type: "source"; sources: SourceItem[]; message_index: number }
+  | { type: "plan_options"; options: PlanOption[]; message_index: number }
   | { type: "done" };
+
+export interface PlanOption {
+  id: string;
+  title: string;
+  description: string;
+  pros: string[];
+  cons: string[];
+}
 
 // ---- projects ----
 
@@ -51,6 +70,16 @@ export async function createProject(name: string): Promise<Project> {
 export async function deleteProject(id: string): Promise<void> {
   const res = await fetch(`${BASE}/projects/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(await res.text());
+}
+
+export async function renameProject(id: string, name: string): Promise<Project> {
+  const res = await fetch(`${BASE}/projects/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 }
 
 export async function getHistory(projectId: string): Promise<HistoryMessage[]> {
@@ -118,6 +147,13 @@ export function streamChat(
       }
     }
   });
+}
+
+export async function getSources(projectId: string): Promise<SourceItem[]> {
+  const res = await fetch(`${BASE}/projects/${projectId}/sources`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.sources;
 }
 
 // ---- preferences ----
@@ -191,4 +227,67 @@ export async function exportReport(projectId: string): Promise<string> {
   if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
   return data.report;
+}
+
+// ---- plan resume (人机协同) ----
+
+export function resumeChat(
+  projectId: string,
+  chosenPlanId: string,
+  customPlanText: string,
+  onEvent: (event: SSEEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return fetch(`${BASE}/chat/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      project_id: projectId,
+      chosen_plan_id: chosenPlanId,
+      custom_plan_text: customPlanText,
+    }),
+    signal,
+  }).then(async (res) => {
+    if (!res.ok) throw new Error(await res.text());
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error("No response body");
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("data: ")) {
+          const json = trimmed.slice(6);
+          if (json) {
+            try {
+              onEvent(JSON.parse(json));
+            } catch {
+              // skip unparseable chunks
+            }
+          }
+        }
+      }
+    }
+
+    const remaining = buffer.trim();
+    if (remaining.startsWith("data: ")) {
+      const json = remaining.slice(6);
+      if (json) {
+        try {
+          onEvent(JSON.parse(json));
+        } catch {
+          // skip
+        }
+      }
+    }
+  });
 }

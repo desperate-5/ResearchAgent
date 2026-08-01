@@ -11,6 +11,10 @@ class CreateProjectRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200, description="项目名称")
 
 
+class RenameProjectRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200, description="新项目名称")
+
+
 class ProjectResponse(BaseModel):
     id: str
     name: str
@@ -50,3 +54,11 @@ class FeedbackRequest(BaseModel):
     type: str = Field(..., description="like / dislike")
     tag: str = Field(default="", description="快捷标签，如 '太啰嗦'、'需要英文文献'")
     comment: str = Field(default="", description="自由文本补充")
+
+
+# ---- 方案选择（人机协同） ----
+
+class PlanResumeRequest(BaseModel):
+    project_id: str = Field(..., description="项目 ID")
+    chosen_plan_id: str = Field(default="", description="用户选择的预制方案 ID")
+    custom_plan_text: str = Field(default="", description="用户自定义的方案文本")

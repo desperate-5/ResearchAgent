@@ -1,4 +1,4 @@
-"""科研助手 Agent — 启动入口."""
+"""多智能体科研系统 — 启动入口."""
 import uvicorn
 from dotenv import load_dotenv
 
