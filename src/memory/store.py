@@ -17,8 +17,33 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def init_db():
-    """初始化数据库，创建所有必要的表（projects、messages、summaries、project_preferences、project_sources、project_plans）和索引。"""
+    """初始化数据库，创建所有必要的表（projects、messages、summaries、project_sources、project_plans）和索引。
+    如果存在旧的 user_preferences 表，则迁移数据到 preferences.md 并删除旧表。"""
     conn = _get_conn()
+
+    # ── 迁移：旧版 user_preferences 表 → data/preferences.md ──
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='user_preferences'"
+    )
+    if cursor.fetchone():
+        row = conn.execute(
+            "SELECT literature, writing, experiment, tool FROM user_preferences WHERE id = 1"
+        ).fetchone()
+        if row and not os.path.exists(os.path.join("data", "preferences.md")):
+            lit = json.loads(row["literature"] or "{}")
+            wrt = json.loads(row["writing"] or "{}")
+            exp = json.loads(row["experiment"] or "{}")
+            tool = json.loads(row["tool"] or "{}")
+            yaml_dict = {"literature": lit, "writing": wrt, "experiment": exp, "tool": tool}
+            import yaml as _yaml
+            yaml_block = _yaml.dump(yaml_dict, allow_unicode=True, default_flow_style=False, sort_keys=False).strip()
+            os.makedirs("data", exist_ok=True)
+            with open(os.path.join("data", "preferences.md"), "w", encoding="utf-8") as f:
+                f.write(f"---\n{yaml_block}\n---\n\n# 科研助手偏好配置\n\n此文件已从旧版数据库中自动迁移。\n")
+        conn.execute("DROP TABLE IF EXISTS user_preferences")
+        conn.execute("DROP TABLE IF EXISTS project_preferences")
+        conn.commit()
+
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS projects (
             id TEXT PRIMARY KEY,
@@ -39,14 +64,6 @@ def init_db():
             project_id TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS project_preferences (
-            project_id TEXT PRIMARY KEY,
-            literature TEXT NOT NULL DEFAULT '{}',
-            writing TEXT NOT NULL DEFAULT '{}',
-            experiment TEXT NOT NULL DEFAULT '{}',
-            tool TEXT NOT NULL DEFAULT '{}',
             FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS project_sources (

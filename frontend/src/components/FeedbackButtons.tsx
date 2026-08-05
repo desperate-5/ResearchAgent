@@ -8,18 +8,14 @@ const QUICK_TAGS = [
   "需要最新文献",
 ];
 
-interface Props {
-  projectId: string;
-}
-
-export default function FeedbackButtons({ projectId }: Props) {
+export default function FeedbackButtons() {
   const [liked, setLiked] = useState<string | null>(null);
   const [activeTags, setActiveTags] = useState<Set<string>>(new Set());
 
   const handleLike = (type: "like" | "dislike") => {
     const next = liked === type ? null : type;
     setLiked(next);
-    sendFeedback(projectId, type).catch(console.error);
+    sendFeedback(type).catch(console.error);
   };
 
   const handleTag = (tag: string) => {
@@ -32,7 +28,7 @@ export default function FeedbackButtons({ projectId }: Props) {
       }
       return next;
     });
-    sendFeedback(projectId, "dislike", tag).catch(console.error);
+    sendFeedback("dislike", tag).catch(console.error);
   };
 
   return (

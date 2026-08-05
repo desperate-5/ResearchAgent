@@ -34,7 +34,7 @@ def web_search(query: str) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         return f"搜索请求失败: {e}"

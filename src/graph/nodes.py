@@ -1,9 +1,11 @@
 import os
 import json
 import re
+import asyncio
 import hashlib
+
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
+from langchain_core.messages import SystemMessage, ToolMessage, RemoveMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
 from .state import AgentState
@@ -19,16 +21,19 @@ from ..preferences.manager import get_preferences
 from ..preferences.prompt_builder import build_preference_prompt
 
 from .prompts import (
-    MAX_CONTEXT_MESSAGES,
-    COMPRESSION_THRESHOLD,
+    MAX_CONTEXT_TURNS,
+    COMPRESSION_TURN_THRESHOLD,
     MAX_TOOL_ITERATIONS,
     TOOL_AGENT_MAP,
+    SEARCH_KEYWORDS,
     RESEARCHER_PROMPT,
     ANALYST_PROMPT,
     PLANNER_PROMPT,
 )
 from .context import (
     get_recent_messages,
+    count_turns,
+    last_n_turns,
     build_supervisor_context,
     build_reviewer_context,
     build_planner_context,
@@ -43,7 +48,7 @@ def get_llm(streaming: bool = False) -> ChatOpenAI:
         base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
         temperature=0.7,
         streaming=streaming,
-        request_timeout=int(os.getenv("LLM_TIMEOUT", "120")),
+        request_timeout=int(os.getenv("LLM_TIMEOUT", "60")),
     )
 
 
@@ -55,6 +60,9 @@ RESEARCHER_TOOLS = [web_search, aminer_search_papers]
 ANALYST_TOOLS = [calculator, python_executor]
 REVIEWER_TOOLS = []
 
+# 当前图中实际注册的 agent（最小模式仅 researcher；恢复全量时补全 analyst/planner/reviewer）
+AVAILABLE_AGENTS = {"researcher"}
+
 
 # ============================================================
 # 图节点
@@ -64,7 +72,7 @@ async def load_context_node(state: AgentState) -> dict:
     """加载上下文：偏好配置、历史摘要。不做自动 RAG 注入（由 researcher 按需检索）。"""
     project_id = state["project_id"]
 
-    prefs = get_preferences(project_id)
+    prefs = get_preferences()
     prefs_text = build_preference_prompt(prefs)
 
     context_parts = []
@@ -87,58 +95,152 @@ async def load_context_node(state: AgentState) -> dict:
 
 
 async def supervisor_node(state: AgentState) -> dict:
-    """调度者节点：决定接下来调用哪个子 agent，或者结束调度。"""
+    """调度者节点：纯规则调度，不调用 LLM。
+
+    1) 用户指定了工具约束 → 按 TOOL_AGENT_MAP 映射到对应 agent（未执行过的优先）；
+    2) 否则用关键词判断是否需要文献检索；
+    3) 都不需要 → FINISH。
+    """
     log = state.get("supervisor_log", [])
     agent_outputs = state.get("agent_outputs", {})
 
-    # 防止无限循环：最多调度 3 次（2 次 agent + 1 次 FINISH）
+    # 防止无限循环：最多调度 5 次
     if len(log) >= 5:
         return {
             "next_agent": "FINISH",
             "supervisor_log": log + [{"next": "FINISH", "reason": "达到最大调度次数"}],
         }
 
-    # planner 已完成方案设计，不允许再次调用，直接结束调度
+    # planner 已完成方案设计，不再调用
     if "planner" in agent_outputs:
         return {
             "next_agent": "FINISH",
             "supervisor_log": log + [{"next": "FINISH", "reason": "planner 已完成方案设计，结束调度"}],
         }
 
-    llm = get_llm()
-    msgs = build_supervisor_context(state)
-    response = await llm.ainvoke(msgs)
-    decision = _parse_decision(response.content)
+    # ─── 用户明确指定了工具：按映射直接调度，无需 LLM 判断 ───
+    required_tools = state.get("required_tools", [])
+    if required_tools:
+        for tool_name in required_tools:
+            agent = TOOL_AGENT_MAP.get(tool_name)
+            if agent not in AVAILABLE_AGENTS:
+                continue
+            if agent not in agent_outputs:
+                return {
+                    "next_agent": agent,
+                    "supervisor_log": log + [{"next": agent, "reason": f"用户指定工具 {tool_name}"}],
+                }
+        return {
+            "next_agent": "FINISH",
+            "supervisor_log": log + [{"next": "FINISH", "reason": "用户指定工具均已执行"}],
+        }
 
-    log_entry = {
-        "next": decision["next"],
-        "reason": decision["reason"],
-    }
+    # ─── 无工具约束：关键词启发式判断是否需检索 ───
+    user_text = _extract_user_query(state)
+    if any(kw in user_text for kw in SEARCH_KEYWORDS):
+        return {
+            "next_agent": "researcher",
+            "supervisor_log": log + [{"next": "researcher", "reason": "问题包含检索意图关键词"}],
+        }
 
     return {
-        "next_agent": decision["next"],
-        "supervisor_log": log + [log_entry],
+        "next_agent": "FINISH",
+        "supervisor_log": log + [{"next": "FINISH", "reason": "普通问答，无需工具"}],
     }
 
 
 async def researcher_node(state: AgentState) -> dict:
-    """文献检索 agent：动态组装工具（全局工具 + 项目级 RAG 工具）。"""
+    """文献检索 agent。LLM 决定调用哪些工具，并行执行后直接返回原始结果（不做二次总结，节省 2-5s）。"""
     llm = get_llm()
     user_msgs = get_recent_messages(state)
     context = state.get("system_prompt", "")
-
     project_id = state["project_id"]
-    tools = RESEARCHER_TOOLS + [_make_rag_tool(project_id)]
 
     full_prompt = RESEARCHER_PROMPT
     if context:
         full_prompt += f"\n\n## 上下文信息\n{context}"
 
-    content, ref_sources = await _run_tool_loop(llm, full_prompt, user_msgs, tools)
+    tools = [web_search, aminer_search_papers, _make_rag_tool(project_id)]
+
+    all_sources: list[dict] = []
+    seen_ids: set[str] = set()
+    source_counter = 0
+
+    def _collect_sources(tool_name: str, result: str) -> None:
+        nonlocal source_counter
+        parsed = _parse_tool_source(tool_name, result)
+        for s in parsed:
+            if s["id"] not in seen_ids:
+                seen_ids.add(s["id"])
+                source_counter += 1
+                s["source_number"] = source_counter
+                all_sources.append(s)
+
+    async def _invoke_one(tc: dict, tool_obj):
+        try:
+            result = str(await tool_obj.ainvoke(tc.get("args", {})))
+        except Exception as e:
+            result = f"工具执行失败: {e}"
+        return tc, result, tool_obj.name
+
+    # 用户已明确指定检索工具：直接并行执行，跳过 LLM 工具决策（省一次 LLM 往返）
+    user_specified = [t for t in state.get("required_tools", [])
+                      if t in ("web_search", "aminer_search_papers")]
+    if user_specified:
+        query = _extract_user_query(state)[:200]
+        tool_by_name = {t.name: t for t in tools}
+        coros = []
+        for name in user_specified:
+            tool_obj = tool_by_name.get(name)
+            if tool_obj is None:
+                continue
+            args = {"query": query}
+            if name == "aminer_search_papers":
+                args["count"] = 5
+            coros.append(_invoke_one({"id": f"user_{name}", "name": name, "args": args}, tool_obj))
+
+        output_parts = []
+        if coros:
+            results = await asyncio.gather(*coros)
+            for tc, result, tool_name in results:
+                output_parts.append(f"## {tool_name} 结果\n{result}")
+                _collect_sources(tool_name, result)
+
+        return {
+            "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _truncate_output("\n\n".join(output_parts))},
+            "reference_sources": all_sources,
+        }
+
+    llm_with_tools = llm.bind_tools(tools)
+
+    msgs = [SystemMessage(content=full_prompt)] + user_msgs
+    response = await llm_with_tools.ainvoke(msgs)
+
+    if not response.tool_calls:
+        return {
+            "agent_outputs": {**state.get("agent_outputs", {}), "researcher": response.content},
+            "reference_sources": all_sources,
+        }
+
+    # 并行调用所有工具（单轮，不循环，不做 LLM 二次总结）
+    coros = []
+    for tc in response.tool_calls[:3]:
+        tool_name = tc.get("name", "")
+        for tool in tools:
+            if tool.name == tool_name:
+                coros.append(_invoke_one(tc, tool))
+                break
+
+    output_parts = []
+    if coros:
+        results = await asyncio.gather(*coros)
+        for tc, result, tool_name in results:
+            output_parts.append(f"## {tool_name} 结果\n{result}")
+            _collect_sources(tool_name, result)
 
     return {
-        "agent_outputs": {**state.get("agent_outputs", {}), "researcher": content},
-        "reference_sources": ref_sources,
+        "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _truncate_output("\n\n".join(output_parts))},
+        "reference_sources": all_sources,
     }
 
 
@@ -229,26 +331,39 @@ async def generate_response_node(state: AgentState) -> dict:
 
 
 async def memory_compressor_node(state: AgentState) -> dict:
-    """压缩旧对话为结构化摘要。"""
+    """压缩旧对话为结构化摘要（按对话轮数判断，超过 10 轮触发），并裁剪已压缩的旧消息。"""
     all_messages = list(state["messages"])
-    conv_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
 
-    if len(conv_msgs) <= COMPRESSION_THRESHOLD:
+    if count_turns(all_messages) <= COMPRESSION_TURN_THRESHOLD:
         return {}
 
-    keep_recent = 10
-    old_msgs = conv_msgs[:-keep_recent]
+    keep_recent_turns = 5
+    recent_msgs = last_n_turns(all_messages, keep_recent_turns)
+    old_msgs = all_messages[: len(all_messages) - len(recent_msgs)]
 
     new_summary = await generate_summary(old_msgs, state.get("summary", ""))
 
     save_summary(state["project_id"], new_summary)
 
-    return {"summary": new_summary}
+    return {
+        "summary": new_summary,
+        "messages": [RemoveMessage(id=m.id) for m in old_msgs if getattr(m, "id", None)],
+    }
 
 
 # ============================================================
 # 内部函数
 # ============================================================
+
+MAX_OUTPUT_CHARS = 3500
+
+
+def _truncate_output(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
+    """截断过长输出以降低下游 LLM 的首 token 延迟。"""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[结果过长已截断]"
+
 
 def _parse_decision(text: str) -> dict:
     """从 LLM 回复中解析 JSON 决策。"""
@@ -401,24 +516,31 @@ async def _run_tool_loop(llm, system_prompt: str, user_msgs: list, tools: list) 
     source_counter = 0
 
     while response.tool_calls and iterations < MAX_TOOL_ITERATIONS:
-        tool_msgs = []
+        # 并行调用工具（使用 ainvoke 保持 LangGraph 追踪上下文）
+        async def _invoke_one(tc: dict, tool_obj):
+            try:
+                result = str(await tool_obj.ainvoke(tc.get("args", {})))
+            except Exception as e:
+                result = f"工具执行失败: {e}"
+            return tc, result, tool_obj.name
+
+        coros = []
         for tc in response.tool_calls[:3]:
             tool_name = tc.get("name", "")
-            tool_args = tc.get("args", {})
-            tool_id = tc.get("id", "")
-
-            result = ""
             for tool in tools:
                 if tool.name == tool_name:
-                    try:
-                        result = str(tool.invoke(tool_args))
-                    except Exception as e:
-                        result = f"工具执行失败: {e}"
+                    coros.append(_invoke_one(tc, tool))
                     break
 
-            tool_msgs.append(ToolMessage(content=result, tool_call_id=tool_id))
+        if not coros:
+            break
 
-            # 从原始工具输出中解析来源，分配全局编号（与 server.py 一致的顺序）
+        results = await asyncio.gather(*coros)
+
+        tool_msgs = []
+        for tc, result, tool_name in results:
+            tool_msgs.append(ToolMessage(content=result, tool_call_id=tc.get("id", "")))
+
             if tool_name in ("web_search", "aminer_search_papers", "search_uploaded_docs"):
                 parsed = _parse_tool_source(tool_name, result)
                 for s in parsed:

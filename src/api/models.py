@@ -47,10 +47,15 @@ class UpdatePreferencesRequest(BaseModel):
     tool: ToolPref | None = None
 
 
+# ---- 原始偏好文件 ----
+
+class RawPreferencesRequest(BaseModel):
+    content: str = Field(..., min_length=0, description="preferences.md 的完整原始内容")
+
+
 # ---- 反馈 ----
 
 class FeedbackRequest(BaseModel):
-    project_id: str = Field(..., description="项目 ID")
     type: str = Field(..., description="like / dislike")
     tag: str = Field(default="", description="快捷标签，如 '太啰嗦'、'需要英文文献'")
     comment: str = Field(default="", description="自由文本补充")

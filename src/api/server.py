@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import sys
 import hashlib
 from contextlib import asynccontextmanager
 
@@ -16,13 +17,13 @@ from ..graph.builder import build_graph
 from ..graph.state import AgentState
 from ..memory.store import init_db, save_message, get_history, get_summary, save_project_sources, get_project_sources, save_project_plan, get_latest_plan
 from ..projects.manager import create_project, list_projects, get_project, delete_project, rename_project, update_timestamp
-from ..preferences.manager import get_preferences, save_preferences, apply_feedback
-from ..preferences.models import PreferencesConfig
+from ..preferences.manager import get_preferences, save_preferences, apply_feedback, get_raw_preferences, save_raw_preferences
 from ..tools import file_rag
 from ..export.report import generate_report
 from .models import (
     ChatRequest, CreateProjectRequest, RenameProjectRequest,
     UpdatePreferencesRequest, FeedbackRequest, PlanResumeRequest,
+    RawPreferencesRequest,
 )
 
 
@@ -48,10 +49,7 @@ app.mount("/plots", StaticFiles(directory=os.path.join("data", "plots")), name="
 
 @app.post("/projects")
 def api_create_project(req: CreateProjectRequest):
-    proj = create_project(req.name)
-    # 为新项目初始化空偏好
-    save_preferences(proj["id"], PreferencesConfig())
-    return proj
+    return create_project(req.name)
 
 
 @app.get("/projects")
@@ -103,19 +101,15 @@ def api_get_history(project_id: str):
 # 偏好 API
 # ============================================================
 
-@app.get("/projects/{project_id}/preferences")
-def api_get_preferences(project_id: str):
-    if not get_project(project_id):
-        raise HTTPException(status_code=404, detail="项目不存在")
-    return get_preferences(project_id)
+@app.get("/preferences")
+def api_get_preferences():
+    return get_preferences()
 
 
-@app.put("/projects/{project_id}/preferences")
-def api_update_preferences(project_id: str, req: UpdatePreferencesRequest):
-    if not get_project(project_id):
-        raise HTTPException(status_code=404, detail="项目不存在")
+@app.put("/preferences")
+def api_update_preferences(req: UpdatePreferencesRequest):
     # 合并：只更新传入的非空字段
-    current = get_preferences(project_id)
+    current = get_preferences()
     if req.literature is not None:
         current.literature = req.literature
     if req.writing is not None:
@@ -124,8 +118,28 @@ def api_update_preferences(project_id: str, req: UpdatePreferencesRequest):
         current.experiment = req.experiment
     if req.tool is not None:
         current.tool = req.tool
-    save_preferences(project_id, current)
+    save_preferences(current)
     return current
+
+
+# ============================================================
+# 原始偏好文件 API（用于设置编辑器）
+# ============================================================
+
+@app.get("/preferences/raw")
+def api_get_raw_preferences():
+    """返回 preferences.md 的完整原始内容。"""
+    return {"content": get_raw_preferences()}
+
+
+@app.put("/preferences/raw")
+def api_update_raw_preferences(req: RawPreferencesRequest):
+    """保存原始 markdown 内容到 preferences.md，同时解析 YAML 返回结构化结果。"""
+    parsed = save_raw_preferences(req.content)
+    return {
+        "status": "saved",
+        "preferences": parsed.model_dump() if parsed else None,
+    }
 
 
 # ============================================================
@@ -134,11 +148,8 @@ def api_update_preferences(project_id: str, req: UpdatePreferencesRequest):
 
 @app.post("/feedback")
 def api_feedback(req: FeedbackRequest):
-    if not get_project(req.project_id):
-        raise HTTPException(status_code=404, detail="项目不存在")
-
     if req.tag:
-        updated = apply_feedback(req.project_id, req.tag)
+        updated = apply_feedback(req.tag)
         if updated is not None:
             return {
                 "status": "applied",
@@ -332,6 +343,27 @@ def _parse_tool_sources(tool_name: str, output_text: str) -> list[dict]:
     return []
 
 
+def _merge_state_sources(graph_state, source_number_map, source_counter, message_index, all_sources):
+    """从 graph state 的 reference_sources 中读取来源，合并到 all_sources。"""
+    state_values = graph_state.values if hasattr(graph_state, "values") else {}
+    ref_sources = state_values.get("reference_sources", [])
+    new_sources: list[dict] = []
+    if not ref_sources:
+        return new_sources
+    for s in ref_sources:
+        sid = s.get("id", "")
+        if sid not in source_number_map:
+            source_counter[0] += 1
+            source_number_map[sid] = source_counter[0]
+        s = dict(s)
+        s["source_number"] = source_number_map.get(sid, s.get("source_number", 0))
+        if not any(x.get("id") == sid for x in all_sources):
+            s["message_index"] = message_index
+            all_sources.append(s)
+            new_sources.append(s)
+    return new_sources
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest, req: Request):
     if not get_project(request.project_id):
@@ -363,7 +395,7 @@ async def chat(request: ChatRequest, req: Request):
     config = {"configurable": {"thread_id": request.project_id}}
     graph = req.app.state.graph
 
-    AGENT_NODES = {"researcher", "analyst", "planner", "reviewer", "generate_response"}
+    AGENT_NODES = {"supervisor", "researcher", "analyst", "planner", "reviewer", "generate_response"}
 
     async def event_stream():
         full_response = ""
@@ -378,29 +410,55 @@ async def chat(request: ChatRequest, req: Request):
             async for event in graph.astream_events(initial_state, config, version="v2"):
                 kind = event["event"]
 
+                # --- DEBUG: 打印所有 on_chain_start / on_chain_end 事件以分析 LangGraph 1.x 事件结构 ---
+                if kind in ("on_chain_start", "on_chain_end"):
+                    name = event.get("name", "")
+                    tag = event.get("tags", [])
+                    meta = event.get("metadata", {})
+                    print(f"[DEBUG] {kind}: name={name!r}, tags={tag!r}, meta_keys={list(meta.keys())!r}", file=sys.stderr, flush=True)
+
                 if kind == "on_chain_start":
                     name = event.get("name", "")
-                    if name in AGENT_NODES:
-                        current_agent = name
-                        yield f"data: {json.dumps({'type': 'agent_phase', 'agent': name, 'status': 'start'}, ensure_ascii=False)}\n\n"
+                    meta = event.get("metadata", {})
+                    # 尝试多种方式提取节点名
+                    node = meta.get("langgraph_node", "") or name
+                    # 如果 name 本身就是 agent 节点名，直接用
+                    if not node or node not in AGENT_NODES:
+                        if name in AGENT_NODES:
+                            node = name
+                    if node in AGENT_NODES:
+                        current_agent = node
+                        yield f"data: {json.dumps({'type': 'agent_phase', 'agent': node, 'status': 'start'}, ensure_ascii=False)}\n\n"
 
                 elif kind == "on_chain_end":
                     name = event.get("name", "")
-                    if name in AGENT_NODES:
-                        yield f"data: {json.dumps({'type': 'agent_phase', 'agent': name, 'status': 'end'}, ensure_ascii=False)}\n\n"
+                    meta = event.get("metadata", {})
+                    node = meta.get("langgraph_node", "") or name
+                    if not node or node not in AGENT_NODES:
+                        if name in AGENT_NODES:
+                            node = name
+                    if node in AGENT_NODES:
+                        yield f"data: {json.dumps({'type': 'agent_phase', 'agent': node, 'status': 'end'}, ensure_ascii=False)}\n\n"
                         current_agent = None
 
                 elif kind == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]
-                    if chunk.content and current_agent == "generate_response":
-                        full_response += chunk.content
-                        yield f"data: {json.dumps({'type': 'response', 'content': chunk.content}, ensure_ascii=False)}\n\n"
+                    if chunk.content:
+                        if current_agent == "generate_response":
+                            full_response += chunk.content
+                        yield f"data: {json.dumps({'type': 'response', 'content': chunk.content, 'agent': current_agent}, ensure_ascii=False)}\n\n"
 
                 elif kind == "on_tool_start":
-                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': event['name'], 'status': 'start'}, ensure_ascii=False)}\n\n"
+                    meta = event.get("metadata", {})
+                    agent = meta.get("langgraph_node", "") or current_agent or ""
+                    print(f"[DEBUG] on_tool_start: name={event['name']!r}, meta_langgraph_node={meta.get('langgraph_node')!r}, current_agent={current_agent!r}", file=sys.stderr, flush=True)
+                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': event['name'], 'status': 'start', 'agent': agent}, ensure_ascii=False)}\n\n"
                 elif kind == "on_tool_end":
                     tool_name = event["name"]
-                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'status': 'end'}, ensure_ascii=False)}\n\n"
+                    meta = event.get("metadata", {})
+                    agent = meta.get("langgraph_node", "") or current_agent or ""
+                    print(f"[DEBUG] on_tool_end: name={tool_name!r}, meta_langgraph_node={meta.get('langgraph_node')!r}, current_agent={current_agent!r}", file=sys.stderr, flush=True)
+                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'status': 'end', 'agent': agent}, ensure_ascii=False)}\n\n"
                     # 解析工具输出中的结构化来源信息
                     output = event["data"].get("output")
                     if output is not None and tool_name in ("web_search", "aminer_search_papers", "search_uploaded_docs"):
@@ -423,43 +481,65 @@ async def chat(request: ChatRequest, req: Request):
                             yield f"data: {json.dumps({'type': 'source', 'sources': numbered, 'message_index': message_index}, ensure_ascii=False)}\n\n"
         except GraphInterrupt:
             interrupted = True
+        except Exception as e:
+            # 流内异常也视为中断，确保前端能收到 done 事件
+            import traceback
+            print(f"[ERROR] 图执行异常: {e}")
+            traceback.print_exc()
+            interrupted = True
 
-        # LangGraph 1.x 中 astream_events 不会抛出 GraphInterrupt，流会静默结束。
-        # 因此需要在流结束后主动检查 state 是否被 interrupt 暂停。
-        # 注意：必须用 aget_state，因为 AsyncSqliteSaver 在主线程不允许同步调用。
-        if not interrupted:
-            graph_state = await graph.aget_state(config)
-            if graph_state.interrupts:
-                interrupted = True
-                # 检查 interrupt 是否是我们关注的 plan_options 类型
-                is_plan = any(
-                    isinstance(it.value, dict) and it.value.get("type") == "plan_options"
-                    for it in graph_state.interrupts
-                )
-                if not is_plan:
-                    interrupted = False  # 非 planner 中断，按正常流程处理
+        try:
+            # LangGraph 1.x 中 astream_events 不会抛出 GraphInterrupt，流会静默结束。
+            # 因此需要在流结束后主动检查 state 是否被 interrupt 暂停。
+            if not interrupted:
+                graph_state = await graph.aget_state(config)
+                if graph_state.interrupts:
+                    interrupted = True
+                    is_plan = any(
+                        isinstance(it.value, dict) and it.value.get("type") == "plan_options"
+                        for it in graph_state.interrupts
+                    )
+                    if not is_plan:
+                        interrupted = False
 
-        if interrupted:
-            graph_state = await graph.aget_state(config)
-            plan_options = []
-            for it in graph_state.interrupts:
-                val = it.value
-                if isinstance(val, dict) and val.get("type") == "plan_options":
-                    plan_options = val.get("options", [])
-                    break
-            # 持久化本轮已收集的来源，防止中断导致来源丢失
+            if interrupted:
+                graph_state = await graph.aget_state(config)
+                plan_options = []
+                for it in graph_state.interrupts:
+                    val = it.value
+                    if isinstance(val, dict) and val.get("type") == "plan_options":
+                        plan_options = val.get("options", [])
+                        break
+                state_sources = _merge_state_sources(graph_state, source_number_map, source_counter, message_index, all_sources)
+                if state_sources:
+                    yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+                if all_sources:
+                    save_project_sources(request.project_id, all_sources)
+                if plan_options:
+                    yield f"data: {json.dumps({'type': 'plan_options', 'options': plan_options, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
+            # 如果流式未捕获到回复内容，从 state 中读取（流式事件可能未触发）
+            if not full_response:
+                state_values = graph_state.values if hasattr(graph_state, "values") else {}
+                msgs = state_values.get("messages", [])
+                for m in reversed(msgs):
+                    if hasattr(m, "type") and m.type == "ai" and hasattr(m, "content") and m.content:
+                        full_response = m.content
+                        yield f"data: {json.dumps({'type': 'response', 'content': full_response}, ensure_ascii=False)}\n\n"
+                        break
+
+            save_message(request.project_id, "assistant", full_response)
+            state_sources = _merge_state_sources(graph_state, source_number_map, source_counter, message_index, all_sources)
+            if state_sources:
+                yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
             if all_sources:
                 save_project_sources(request.project_id, all_sources)
-            if plan_options:
-                yield f"data: {json.dumps({'type': 'plan_options', 'options': plan_options, 'message_index': message_index}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
-            return  # 不调 save_message，等用户选择后 resume
-
-        save_message(request.project_id, "assistant", full_response)
-        # 持久化本轮来源
-        if all_sources:
-            save_project_sources(request.project_id, all_sources)
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        except Exception:
+            # 确保无论如何都发送 done，防止前端永久显示"停止"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -498,7 +578,7 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
     if plan_detail:
         save_project_plan(request.project_id, request.chosen_plan_id, plan_title, plan_detail, is_custom)
 
-    AGENT_NODES = {"researcher", "analyst", "planner", "reviewer", "generate_response"}
+    AGENT_NODES = {"supervisor", "researcher", "analyst", "planner", "reviewer", "generate_response"}
 
     async def event_stream():
         full_response = ""
@@ -513,29 +593,52 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
             async for event in graph.astream_events(Command(resume=user_choice), config, version="v2"):
                 kind = event["event"]
 
+                if kind in ("on_chain_start", "on_chain_end"):
+                    name = event.get("name", "")
+                    tag = event.get("tags", [])
+                    meta = event.get("metadata", {})
+                    print(f"[DEBUG] resume {kind}: name={name!r}, tags={tag!r}, meta_keys={list(meta.keys())!r}", file=sys.stderr, flush=True)
+
                 if kind == "on_chain_start":
                     name = event.get("name", "")
-                    if name in AGENT_NODES:
-                        current_agent = name
-                        yield f"data: {json.dumps({'type': 'agent_phase', 'agent': name, 'status': 'start'}, ensure_ascii=False)}\n\n"
+                    meta = event.get("metadata", {})
+                    node = meta.get("langgraph_node", "") or name
+                    if not node or node not in AGENT_NODES:
+                        if name in AGENT_NODES:
+                            node = name
+                    if node in AGENT_NODES:
+                        current_agent = node
+                        yield f"data: {json.dumps({'type': 'agent_phase', 'agent': node, 'status': 'start'}, ensure_ascii=False)}\n\n"
 
                 elif kind == "on_chain_end":
                     name = event.get("name", "")
-                    if name in AGENT_NODES:
-                        yield f"data: {json.dumps({'type': 'agent_phase', 'agent': name, 'status': 'end'}, ensure_ascii=False)}\n\n"
+                    meta = event.get("metadata", {})
+                    node = meta.get("langgraph_node", "") or name
+                    if not node or node not in AGENT_NODES:
+                        if name in AGENT_NODES:
+                            node = name
+                    if node in AGENT_NODES:
+                        yield f"data: {json.dumps({'type': 'agent_phase', 'agent': node, 'status': 'end'}, ensure_ascii=False)}\n\n"
                         current_agent = None
 
                 elif kind == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]
-                    if chunk.content and current_agent == "generate_response":
-                        full_response += chunk.content
-                        yield f"data: {json.dumps({'type': 'response', 'content': chunk.content}, ensure_ascii=False)}\n\n"
+                    if chunk.content:
+                        if current_agent == "generate_response":
+                            full_response += chunk.content
+                        yield f"data: {json.dumps({'type': 'response', 'content': chunk.content, 'agent': current_agent}, ensure_ascii=False)}\n\n"
 
                 elif kind == "on_tool_start":
-                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': event['name'], 'status': 'start'}, ensure_ascii=False)}\n\n"
+                    meta = event.get("metadata", {})
+                    agent = meta.get("langgraph_node", "") or current_agent or ""
+                    print(f"[DEBUG] resume on_tool_start: name={event['name']!r}, meta_langgraph_node={meta.get('langgraph_node')!r}, current_agent={current_agent!r}", file=sys.stderr, flush=True)
+                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': event['name'], 'status': 'start', 'agent': agent}, ensure_ascii=False)}\n\n"
                 elif kind == "on_tool_end":
                     tool_name = event["name"]
-                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'status': 'end'}, ensure_ascii=False)}\n\n"
+                    meta = event.get("metadata", {})
+                    agent = meta.get("langgraph_node", "") or current_agent or ""
+                    print(f"[DEBUG] resume on_tool_end: name={tool_name!r}, meta_langgraph_node={meta.get('langgraph_node')!r}, current_agent={current_agent!r}", file=sys.stderr, flush=True)
+                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'status': 'end', 'agent': agent}, ensure_ascii=False)}\n\n"
                     output = event["data"].get("output")
                     if output is not None and tool_name in ("web_search", "aminer_search_papers", "search_uploaded_docs"):
                         output_text = str(output.content) if hasattr(output, "content") else str(output)
@@ -555,34 +658,57 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
                             yield f"data: {json.dumps({'type': 'source', 'sources': numbered, 'message_index': message_index}, ensure_ascii=False)}\n\n"
         except GraphInterrupt:
             interrupted = True
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] resume 图执行异常: {e}")
+            traceback.print_exc()
+            interrupted = True
 
-        # 防御：如果 resume 后又触发了 interrupt（如 supervisor 再次调用 planner）
-        if not interrupted:
-            graph_state = await graph.aget_state(config)
-            if graph_state.interrupts:
-                is_plan = any(
-                    isinstance(it.value, dict) and it.value.get("type") == "plan_options"
-                    for it in graph_state.interrupts
-                )
-                if is_plan:
-                    interrupted = True
+        try:
+            if not interrupted:
+                graph_state = await graph.aget_state(config)
+                if graph_state.interrupts:
+                    is_plan = any(
+                        isinstance(it.value, dict) and it.value.get("type") == "plan_options"
+                        for it in graph_state.interrupts
+                    )
+                    if is_plan:
+                        interrupted = True
 
-        if interrupted:
-            graph_state = await graph.aget_state(config)
-            plan_options = []
-            for it in graph_state.interrupts:
-                val = it.value
-                if isinstance(val, dict) and val.get("type") == "plan_options":
-                    plan_options = val.get("options", [])
-                    break
-            if plan_options:
-                yield f"data: {json.dumps({'type': 'plan_options', 'options': plan_options, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+            if interrupted:
+                graph_state = await graph.aget_state(config)
+                plan_options = []
+                for it in graph_state.interrupts:
+                    val = it.value
+                    if isinstance(val, dict) and val.get("type") == "plan_options":
+                        plan_options = val.get("options", [])
+                        break
+                state_sources = _merge_state_sources(graph_state, source_number_map, source_counter, message_index, all_sources)
+                if state_sources:
+                    yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+                if plan_options:
+                    yield f"data: {json.dumps({'type': 'plan_options', 'options': plan_options, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
+            # 如果流式未捕获到回复内容，从 state 中读取（流式事件可能未触发）
+            if not full_response:
+                state_values = graph_state.values if hasattr(graph_state, "values") else {}
+                msgs = state_values.get("messages", [])
+                for m in reversed(msgs):
+                    if hasattr(m, "type") and m.type == "ai" and hasattr(m, "content") and m.content:
+                        full_response = m.content
+                        yield f"data: {json.dumps({'type': 'response', 'content': full_response}, ensure_ascii=False)}\n\n"
+                        break
+
+            save_message(request.project_id, "assistant", full_response)
+            state_sources = _merge_state_sources(graph_state, source_number_map, source_counter, message_index, all_sources)
+            if state_sources:
+                yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+            if all_sources:
+                save_project_sources(request.project_id, all_sources)
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
-            return
-
-        save_message(request.project_id, "assistant", full_response)
-        if all_sources:
-            save_project_sources(request.project_id, all_sources)
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        except Exception:
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

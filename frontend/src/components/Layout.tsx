@@ -3,9 +3,11 @@ import { Outlet, useNavigate, useParams } from "react-router-dom";
 import { listProjects, deleteProject, renameProject } from "../api/client";
 import type { Project } from "../api/client";
 import ThemeToggle from "./ThemeToggle";
+import SettingsModal from "./SettingsModal";
 
 export default function Layout() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [showSettings, setShowSettings] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
   const navigate = useNavigate();
@@ -62,7 +64,17 @@ export default function Layout() {
       <aside className="sidebar">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
           <h2 style={{ marginBottom: 0 }}>多智能体科研系统</h2>
-          <ThemeToggle />
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <button
+              className="theme-toggle"
+              onClick={() => setShowSettings(true)}
+              title="偏好设置"
+              style={{ fontSize: 16 }}
+            >
+              &#9881;
+            </button>
+            <ThemeToggle />
+          </div>
         </div>
         <button className="new-btn" onClick={() => navigate("/")}>
           + 新建项目
@@ -102,6 +114,7 @@ export default function Layout() {
         </div>
       </aside>
       <Outlet />
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
     </div>
   );
 }

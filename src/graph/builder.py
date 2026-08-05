@@ -5,68 +5,61 @@ from .nodes import (
     load_context_node,
     supervisor_node,
     researcher_node,
-    analyst_node,
-    planner_node,
-    reviewer_node,
+    # analyst_node,      # TODO: 恢复全量时取消注释
+    # planner_node,      # TODO: 恢复全量时取消注释
+    # reviewer_node,     # TODO: 恢复全量时取消注释
     generate_response_node,
     memory_compressor_node,
 )
-from .router import route_from_supervisor, route_after_generate
+from .router import route_after_generate, route_from_supervisor_minimal as route_from_supervisor, route_after_researcher
+# TODO: 恢复全量时替换上一行为: from .router import route_after_generate, route_from_supervisor
 
 
 def build_graph(checkpointer=None):
-    """构建并编译多 Agent LangGraph 图。
+    """构建并编译多 Agent LangGraph 图（当前为最小测试模式: supervisor + researcher）。
 
-    图结构:
-        START
-          │
-    load_context
-          │
-    supervisor ──────────────────────────────────────────┐
-      │         │          │          │                  │
-    researcher analyst  planner   reviewer   generate_response
-      │         │          │          │                  │
-      └─────────┴──────────┴──────────┘                  │
-          │                                      memory_compressor
-          ▼                                              │
-    supervisor (循环)                                    END
+    恢复全量模式时:
+    1. 取消 nodes 和 router 中标注 TODO 的注释
+    2. 把下面被注释的 add_node 和 add_edge 恢复
     """
     graph = StateGraph(AgentState)
 
-    # 添加所有节点
     graph.add_node("load_context", load_context_node)
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("researcher", researcher_node)
-    graph.add_node("analyst", analyst_node)
-    graph.add_node("planner", planner_node)
-    graph.add_node("reviewer", reviewer_node)
+    # graph.add_node("analyst", analyst_node)       # TODO: 恢复全量
+    # graph.add_node("planner", planner_node)       # TODO: 恢复全量
+    # graph.add_node("reviewer", reviewer_node)     # TODO: 恢复全量
     graph.add_node("generate_response", generate_response_node)
     graph.add_node("memory_compressor", memory_compressor_node)
 
-    # 入口
     graph.add_edge(START, "load_context")
     graph.add_edge("load_context", "supervisor")
 
-    # supervisor → 条件路由到子 agent 或生成回复
     graph.add_conditional_edges(
         "supervisor",
         route_from_supervisor,
         {
             "researcher": "researcher",
-            "analyst": "analyst",
-            "planner": "planner",
-            "reviewer": "reviewer",
+            # "analyst": "analyst",         # TODO: 恢复全量
+            # "planner": "planner",         # TODO: 恢复全量
+            # "reviewer": "reviewer",       # TODO: 恢复全量
             "generate_response": "generate_response",
         },
     )
 
-    # 每个子 agent 完成后 → 回到 supervisor 继续调度
-    graph.add_edge("researcher", "supervisor")
-    graph.add_edge("analyst", "supervisor")
-    graph.add_edge("planner", "supervisor")
-    graph.add_edge("reviewer", "supervisor")
+    graph.add_conditional_edges(
+        "researcher",
+        route_after_researcher,
+        {
+            "supervisor": "supervisor",
+            "generate_response": "generate_response",
+        },
+    )
+    # graph.add_edge("analyst", "supervisor")      # TODO: 恢复全量
+    # graph.add_edge("planner", "supervisor")      # TODO: 恢复全量
+    # graph.add_edge("reviewer", "supervisor")     # TODO: 恢复全量
 
-    # generate_response → 压缩检查或结束
     graph.add_conditional_edges(
         "generate_response",
         route_after_generate,

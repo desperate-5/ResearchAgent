@@ -58,7 +58,7 @@ def aminer_search_papers(query: str, count: int = 5) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         return f"AMiner 搜索请求失败: {e}"

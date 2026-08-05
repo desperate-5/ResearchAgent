@@ -15,9 +15,11 @@ interface ToolCallEvent {
   tool: string;
   status: "start" | "end";
   id: number;
+  agent?: string;
 }
 
 const AGENT_LABELS: Record<string, string> = {
+  supervisor: "分析调度",
   researcher: "检索文献",
   analyst: "分析数据",
   planner: "方案设计",
@@ -52,7 +54,7 @@ export default function ChatPage() {
   const [rightPanelWidth, setRightPanelWidth] = useState(320);
   const [isDragging, setIsDragging] = useState(false);
   const [planOptions, setPlanOptions] = useState<PlanOption[] | null>(null);
-  const [planMessageIndex, setPlanMessageIndex] = useState(0);
+  const [, setPlanMessageIndex] = useState(0);
   const messagesEnd = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -242,7 +244,7 @@ export default function ChatPage() {
             if (event.status === "start") {
               if (!seenTools.has(event.tool)) {
                 seenTools.add(event.tool);
-                const tc: ToolCallEvent = { tool: event.tool, status: "start", id: ++toolIdCounter };
+                const tc: ToolCallEvent = { tool: event.tool, status: "start", id: ++toolIdCounter, agent: event.agent };
                 setMessages((prev) => {
                   const updated = [...prev];
                   const last = updated[updated.length - 1];
@@ -360,7 +362,7 @@ export default function ChatPage() {
             if (event.status === "start") {
               if (!seenTools.has(event.tool)) {
                 seenTools.add(event.tool);
-                const tc: ToolCallEvent = { tool: event.tool, status: "start", id: ++toolIdCounter };
+                const tc: ToolCallEvent = { tool: event.tool, status: "start", id: ++toolIdCounter, agent: event.agent };
                 setMessages((prev) => {
                   const updated = [...prev];
                   const last = updated[updated.length - 1];
@@ -489,7 +491,7 @@ export default function ChatPage() {
                 <div className="role">{msg.role === "user" ? "你" : "助手"}</div>
 
                 {msg.toolCalls.map((tc) => (
-                  <ToolCallCard key={tc.id} tool={tc.tool} status={tc.status} />
+                  <ToolCallCard key={tc.id} tool={tc.tool} status={tc.status} agent={tc.agent} />
                 ))}
 
                 {msg.content && (
@@ -500,7 +502,7 @@ export default function ChatPage() {
                 )}
 
                 {msg.role === "assistant" && msg.content && !streaming && (
-                  <FeedbackButtons projectId={projectId!} />
+                  <FeedbackButtons />
                 )}
               </div>
             ))}
@@ -533,6 +535,15 @@ export default function ChatPage() {
                   {AGENT_LABELS[agent] || agent}
                 </span>
               ))}
+            </div>
+          )}
+
+          {streaming && activeAgents.size === 0 && (
+            <div className="agent-status">
+              <span className="agent-badge">
+                <span className="dot running" />
+                正在生成回答...
+              </span>
             </div>
           )}
 

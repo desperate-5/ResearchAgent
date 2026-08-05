@@ -472,6 +472,26 @@ input:focus, textarea:focus { border-color: var(--primary); }
 
 .modal h3 { margin-bottom: 16px; }
 
+.modal textarea {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  width: 100%;
+  min-height: 420px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
+.modal textarea:focus {
+  border-color: var(--primary);
+  outline: none;
+}
+
 .modal .report-body {
   font-family: inherit;
   white-space: pre-wrap;

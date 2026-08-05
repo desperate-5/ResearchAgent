@@ -34,8 +34,8 @@ export interface SourceItem {
 }
 
 export type SSEEvent =
-  | { type: "response"; content: string }
-  | { type: "tool_call"; tool: string; status: "start" | "end" }
+  | { type: "response"; content: string; agent?: string }
+  | { type: "tool_call"; tool: string; status: "start" | "end"; agent?: string }
   | { type: "agent_phase"; agent: string; status: "start" | "end" }
   | { type: "source"; sources: SourceItem[]; message_index: number }
   | { type: "plan_options"; options: PlanOption[]; message_index: number }
@@ -158,17 +158,16 @@ export async function getSources(projectId: string): Promise<SourceItem[]> {
 
 // ---- preferences ----
 
-export async function getPreferences(projectId: string): Promise<PreferencesConfig> {
-  const res = await fetch(`${BASE}/projects/${projectId}/preferences`);
+export async function getPreferences(): Promise<PreferencesConfig> {
+  const res = await fetch(`${BASE}/preferences`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function updatePreferences(
-  projectId: string,
   prefs: Partial<PreferencesConfig>
 ): Promise<PreferencesConfig> {
-  const res = await fetch(`${BASE}/projects/${projectId}/preferences`, {
+  const res = await fetch(`${BASE}/preferences`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(prefs),
@@ -177,10 +176,28 @@ export async function updatePreferences(
   return res.json();
 }
 
+// ---- raw preferences (settings editor) ----
+
+export async function getRawPreferences(): Promise<string> {
+  const res = await fetch(`${BASE}/preferences/raw`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.content;
+}
+
+export async function updateRawPreferences(content: string): Promise<unknown> {
+  const res = await fetch(`${BASE}/preferences/raw`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
 // ---- feedback ----
 
 export async function sendFeedback(
-  projectId: string,
   type: "like" | "dislike",
   tag: string = "",
   comment: string = ""
@@ -188,7 +205,7 @@ export async function sendFeedback(
   const res = await fetch(`${BASE}/feedback`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project_id: projectId, type, tag, comment }),
+    body: JSON.stringify({ type, tag, comment }),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();

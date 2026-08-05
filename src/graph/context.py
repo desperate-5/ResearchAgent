@@ -1,22 +1,36 @@
 """上下文构建函数。负责组装各 agent 的消息列表（system prompt + 最近对话 + agent 输出摘要等）。"""
 
-from langchain_core.messages import SystemMessage, AIMessage
+from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
 from .state import AgentState
 from .prompts import (
-    SUPERVISOR_PROMPT,
+    SUPERVISOR_PROMPT_MINIMAL,  # TODO: 恢复全量时改为 SUPERVISOR_PROMPT
+    # SUPERVISOR_PROMPT,        # TODO: 恢复全量时取消注释并替换上一行
     REVIEWER_PROMPT,
     PLANNER_PROMPT,
     GENERATE_PROMPT,
-    MAX_CONTEXT_MESSAGES,
+    MAX_CONTEXT_TURNS,
     TOOL_AGENT_MAP,
 )
 
 
+def count_turns(messages: list) -> int:
+    """统计对话轮数：一轮 = 一条用户消息。"""
+    return sum(1 for m in messages if isinstance(m, HumanMessage))
+
+
+def last_n_turns(messages: list, n: int) -> list:
+    """取最近 n 轮的完整消息（按用户消息边界切分，保证轮次完整）。"""
+    user_indices = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
+    if len(user_indices) <= n:
+        return messages
+    return messages[user_indices[-n]:]
+
+
 def get_recent_messages(state: AgentState) -> list:
-    """获取最近的用户对话消息（不含 system message），最多 MAX_CONTEXT_MESSAGES 条。"""
+    """获取最近的用户对话消息（不含 system message），最多 MAX_CONTEXT_TURNS 轮。"""
     all_messages = list(state["messages"])
     conv_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
-    return conv_msgs[-MAX_CONTEXT_MESSAGES:]
+    return last_n_turns(conv_msgs, MAX_CONTEXT_TURNS)
 
 
 def build_supervisor_context(state: AgentState) -> list:
@@ -25,7 +39,7 @@ def build_supervisor_context(state: AgentState) -> list:
 
     # 拼接系统提示 + 动态上下文（摘要、偏好等）
     context = state.get("system_prompt", "")
-    prompt = SUPERVISOR_PROMPT
+    prompt = SUPERVISOR_PROMPT_MINIMAL  # TODO: 恢复全量时改为 SUPERVISOR_PROMPT
     if context:
         prompt += f"\n\n## 当前上下文\n{context}"
 
@@ -132,9 +146,14 @@ def build_generate_context(state: AgentState) -> list:
     parts = [GENERATE_PROMPT]
     parts.append(f"## 用户的原始问题\n{user_question}")
 
+    MAX_AGENT_OUTPUT = 3000
+
     if agent_outputs.get("researcher"):
         researcher_output = agent_outputs["researcher"]
         ref_sources = state.get("reference_sources", [])
+        # 截断过长检索结果以降低首 token 延迟（TTFT 主要由 prompt 处理时间决定）
+        if len(researcher_output) > MAX_AGENT_OUTPUT:
+            researcher_output = researcher_output[:MAX_AGENT_OUTPUT] + "\n\n[检索结果过长已截断，完整信息见参考文献列表]"
         parts.append(f"## 文献检索结果\n{researcher_output}")
         if ref_sources:
             ref_lines = []
@@ -147,21 +166,30 @@ def build_generate_context(state: AgentState) -> list:
             parts.append(f"## 参考文献编号对照\n" + "\n".join(ref_lines))
             parts.append("**引用来源时请使用「参考文献编号对照」中的全局编号 [N]。不要使用各工具输出中的原始序号。**")
     if agent_outputs.get("analyst"):
-        parts.append(f"## 数据分析结果\n{agent_outputs['analyst']}")
+        out = agent_outputs["analyst"]
+        if len(out) > MAX_AGENT_OUTPUT:
+            out = out[:MAX_AGENT_OUTPUT] + "\n\n[分析结果过长已截断]"
+        parts.append(f"## 数据分析结果\n{out}")
     if agent_outputs.get("reviewer"):
-        parts.append(f"## 学术评审意见\n{agent_outputs['reviewer']}")
+        out = agent_outputs["reviewer"]
+        if len(out) > MAX_AGENT_OUTPUT:
+            out = out[:MAX_AGENT_OUTPUT] + "\n\n[评审意见过长已截断]"
+        parts.append(f"## 学术评审意见\n{out}")
     if agent_outputs.get("planner"):
+        out = agent_outputs["planner"]
+        if len(out) > MAX_AGENT_OUTPUT:
+            out = out[:MAX_AGENT_OUTPUT] + "\n\n[方案过长已截断]"
         chosen_plan_id = state.get("chosen_plan_id", "")
         custom_plan_text = state.get("custom_plan_text", "")
         if chosen_plan_id:
-            parts.append(f"## 用户选定的研究方案（{chosen_plan_id}）\n{agent_outputs['planner']}")
+            parts.append(f"## 用户选定的研究方案（{chosen_plan_id}）\n{out}")
         elif custom_plan_text:
-            parts.append(f"## 用户自定义的研究方案\n{agent_outputs['planner']}")
+            parts.append(f"## 用户自定义的研究方案\n{out}")
         else:
-            parts.append(f"## 研究方案\n{agent_outputs['planner']}")
+            parts.append(f"## 研究方案\n{out}")
 
     context = state.get("system_prompt", "")
     if context:
         parts.append(f"## 其他上下文\n{context}")
 
-    return [SystemMessage(content="\n\n".join(parts))]
+    return [SystemMessage(content="\n\n".join(parts))] + recent[-1:]
