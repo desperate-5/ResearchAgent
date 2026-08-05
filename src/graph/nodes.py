@@ -69,7 +69,7 @@ AVAILABLE_AGENTS = {"researcher"}
 # ============================================================
 
 async def load_context_node(state: AgentState) -> dict:
-    """加载上下文：偏好配置、历史摘要。不做自动 RAG 注入（由 researcher 按需检索）。"""
+    """加载上下文：偏好配置、历史摘要、项目文件列表。不做自动 RAG 注入（由 researcher 按需检索）。"""
     project_id = state["project_id"]
 
     prefs = get_preferences()
@@ -81,6 +81,13 @@ async def load_context_node(state: AgentState) -> dict:
         context_parts.append(f"## 历史对话摘要\n{summary}")
     if prefs_text:
         context_parts.append(prefs_text)
+
+    # 列出项目已上传的文件，帮助 researcher 判断是否需要调用 search_uploaded_docs
+    from ..tools.file_rag import get_project_files
+    project_files = get_project_files(project_id)
+    if project_files:
+        file_names = [f["filename"] for f in project_files]
+        context_parts.append(f"## 项目已上传文件\n{', '.join(file_names)}")
 
     latest_plan = get_latest_plan(project_id)
     if latest_plan:
@@ -185,7 +192,7 @@ async def researcher_node(state: AgentState) -> dict:
 
     # 用户已明确指定检索工具：直接并行执行，跳过 LLM 工具决策（省一次 LLM 往返）
     user_specified = [t for t in state.get("required_tools", [])
-                      if t in ("web_search", "aminer_search_papers")]
+                      if t in ("web_search", "aminer_search_papers", "search_uploaded_docs")]
     if user_specified:
         query = _extract_user_query(state)[:200]
         tool_by_name = {t.name: t for t in tools}
@@ -357,6 +364,9 @@ async def memory_compressor_node(state: AgentState) -> dict:
 
 MAX_OUTPUT_CHARS = 3500
 
+# RAG 片段注入生成 prompt 的最大字符数：与 file_rag 的 CHUNK_SIZE(300) 对齐，保证每块完整注入且 prompt 体量可控
+RAG_CHUNK_MAX_CHARS = 300
+
 
 def _truncate_output(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
     """截断过长输出以降低下游 LLM 的首 token 延迟。"""
@@ -415,7 +425,19 @@ def _make_rag_tool(project_id: str):
         for i, doc in enumerate(docs, 1):
             src = doc.get("filename", "未知文件")
             content = doc.get("content", "")
-            lines.append(f"[{i}] 来源: {src}\n{content}")
+            page = doc.get("page", 1)
+            para = doc.get("paragraph", 0)
+            ci = doc.get("chunk_index", i - 1)
+            section = doc.get("section", "")
+            # 与 CHUNK_SIZE(300) 对齐：块在 300 以内时完整注入，超出才截断
+            if len(content) > RAG_CHUNK_MAX_CHARS:
+                content = content[:RAG_CHUNK_MAX_CHARS] + "…（片段已截断）"
+            header = f"[{i}] 来源: {src}\n分块: {ci}"
+            if section:
+                header += f" | 章节: {section}"
+            if page and para:
+                header += f" | 第{page}页 第{para}段"
+            lines.append(f"{header}\n{content}")
 
         return "\n\n".join(lines)
 
@@ -464,13 +486,33 @@ def _parse_tool_source(tool_name: str, output_text: str) -> list[dict]:
                 "summary": meta.strip()[:300], "source_type": "paper",
             })
     elif tool_name == "search_uploaded_docs":
-        pattern = re.compile(r'\[(\d+)\]\s*来源:\s*(.+?)\n(.+?)(?=\[\d+\]|\Z)', re.DOTALL)
+        pattern = re.compile(
+            r'\[(\d+)\]\s*来源:\s*(\S+)\n分块:\s*(\d+)(?:\s*\|\s*章节:\s*(.+?))?(?:\s*\|\s*第(\d+)页\s+第(\d+)段)?\n(.+?)(?=\[\d+\]|\Z)',
+            re.DOTALL,
+        )
         for m in pattern.finditer(output_text):
-            title = m.group(2).strip()
-            sid = hashlib.md5(title.encode()).hexdigest()[:12]
+            filename = m.group(2).strip()
+            chunk_index = int(m.group(3))
+            section = (m.group(4) or "").strip()
+            page = int(m.group(5)) if m.group(5) else 1
+            paragraph = int(m.group(6)) if m.group(6) else 0
+            content = m.group(7).strip()
+            sid = hashlib.md5(f"{filename}_{chunk_index}".encode()).hexdigest()[:12]
+            pos_parts = []
+            if section:
+                pos_parts.append(section)
+            if paragraph:
+                pos_parts.append(f"第{paragraph}段")
             sources.append({
-                "id": sid, "title": title, "url": "",
-                "summary": m.group(3).strip()[:300], "source_type": "document",
+                "id": sid,
+                "title": filename,
+                "url": "",
+                "summary": content[:50].replace("\n", " "),
+                "source_type": "document",
+                "page": page,
+                "position": " | ".join(pos_parts),
+                "chunk_index": chunk_index,
+                "section": section,
             })
     return sources
 

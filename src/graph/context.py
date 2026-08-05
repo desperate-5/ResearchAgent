@@ -159,10 +159,18 @@ def build_generate_context(state: AgentState) -> list:
             ref_lines = []
             for s in ref_sources:
                 sn = s["source_number"]
+                title = s['title']
+                extra = ""
+                if s.get("section"):
+                    extra = f"「{s['section']}」"
+                if s.get("page") and s.get("position"):
+                    extra += f" 第{s['page']}页 {s['position']}"
+                if extra:
+                    title += f" ({extra.strip()})"
                 if s.get("url"):
-                    ref_lines.append(f"[{sn}] {s['title']} - {s['url']}")
+                    ref_lines.append(f"[{sn}] {title} - {s['url']}")
                 else:
-                    ref_lines.append(f"[{sn}] {s['title']}")
+                    ref_lines.append(f"[{sn}] {title}")
             parts.append(f"## 参考文献编号对照\n" + "\n".join(ref_lines))
             parts.append("**引用来源时请使用「参考文献编号对照」中的全局编号 [N]。不要使用各工具输出中的原始序号。**")
     if agent_outputs.get("analyst"):

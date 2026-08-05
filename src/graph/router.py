@@ -1,6 +1,6 @@
 from langgraph.graph import END
 from .state import AgentState
-from .nodes import COMPRESSION_TURN_THRESHOLD
+from .prompts import COMPRESSION_TURN_THRESHOLD
 from .context import count_turns
 
 
@@ -26,8 +26,9 @@ def route_from_supervisor_minimal(state: AgentState) -> str:
 
 
 def route_after_generate(state: AgentState) -> str:
-    """生成回复后，检查是否需要压缩（按对话轮数判断）。"""
-    if count_turns(state["messages"]) > COMPRESSION_TURN_THRESHOLD:
+    """生成回复后，若对话轮数超过阈值则触发记忆压缩，否则结束。"""
+    messages = list(state.get("messages", []))
+    if count_turns(messages) > COMPRESSION_TURN_THRESHOLD:
         return "memory_compressor"
     return END
 

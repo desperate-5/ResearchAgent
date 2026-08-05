@@ -62,6 +62,11 @@ export default function SourcesPanel({ sources, onJumpToMessage, highlightIndex 
               <div className="source-title" title={s.title}>
                 {s.title}
               </div>
+              {s.source_type === "document" && (s.page != null || s.position) && (
+                <div className="source-location">
+                  {s.position ? `${s.position} | ` : ""}第{s.page}页
+                </div>
+              )}
               {s.summary && (
                 <div className="source-summary">{s.summary}</div>
               )}

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -15,7 +16,10 @@ from langgraph.errors import GraphInterrupt
 
 from ..graph.builder import build_graph
 from ..graph.state import AgentState
-from ..memory.store import init_db, save_message, get_history, get_summary, save_project_sources, get_project_sources, save_project_plan, get_latest_plan
+from ..graph.context import count_turns, last_n_turns
+from ..graph.prompts import COMPRESSION_TURN_THRESHOLD
+from ..memory.store import init_db, save_message, get_history, get_summary, save_summary, save_project_sources, get_project_sources, save_project_plan, get_latest_plan
+from ..memory.compressor import generate_summary
 from ..projects.manager import create_project, list_projects, get_project, delete_project, rename_project, update_timestamp
 from ..preferences.manager import get_preferences, save_preferences, apply_feedback, get_raw_preferences, save_raw_preferences
 from ..tools import file_rag
@@ -25,6 +29,23 @@ from .models import (
     UpdatePreferencesRequest, FeedbackRequest, PlanResumeRequest,
     RawPreferencesRequest,
 )
+
+
+async def _background_compress(project_id: str, graph_state):
+    """后台压缩历史消息，保存摘要供下次请求使用。不阻塞当前响应。"""
+    try:
+        state_values = graph_state.values if hasattr(graph_state, "values") else {}
+        messages = list(state_values.get("messages", []))
+        if count_turns(messages) <= COMPRESSION_TURN_THRESHOLD:
+            return
+        recent_msgs = last_n_turns(messages, 5)
+        old_msgs = messages[: len(messages) - len(recent_msgs)]
+        if not old_msgs:
+            return
+        new_summary = await generate_summary(old_msgs, state_values.get("summary", ""))
+        save_summary(project_id, new_summary)
+    except Exception:
+        pass  # 压缩失败不影响主流程
 
 
 @asynccontextmanager
@@ -317,17 +338,33 @@ def _parse_paper_sources(text: str) -> list[dict]:
 def _parse_rag_sources(text: str) -> list[dict]:
     """解析 search_uploaded_docs 工具输出中的文档来源信息。"""
     sources = []
-    # 匹配格式: [N] 来源: filename\ncontent
-    pattern = re.compile(r'\[(\d+)\]\s*来源:\s*(.+?)\n(.+?)(?=\[\d+\]|\Z)', re.DOTALL)
+    pattern = re.compile(
+        r'\[(\d+)\]\s*来源:\s*(\S+)\n分块:\s*(\d+)(?:\s*\|\s*章节:\s*(.+?))?(?:\s*\|\s*第(\d+)页\s+第(\d+)段)?\n(.+?)(?=\[\d+\]|\Z)',
+        re.DOTALL,
+    )
     for m in pattern.finditer(text):
-        title = m.group(2).strip()
-        sid = hashlib.md5(title.encode()).hexdigest()[:12]
+        filename = m.group(2).strip()
+        chunk_index = int(m.group(3))
+        section = (m.group(4) or "").strip()
+        page = int(m.group(5)) if m.group(5) else 1
+        paragraph = int(m.group(6)) if m.group(6) else 0
+        content = m.group(7).strip()
+        sid = hashlib.md5(f"{filename}_{chunk_index}".encode()).hexdigest()[:12]
+        pos_parts = []
+        if section:
+            pos_parts.append(section)
+        if paragraph:
+            pos_parts.append(f"第{paragraph}段")
         sources.append({
             "id": sid,
-            "title": title,
+            "title": filename,
             "url": "",
-            "summary": m.group(3).strip()[:300],
+            "summary": content[:50].replace("\n", " "),
             "source_type": "document",
+            "page": page,
+            "position": " | ".join(pos_parts),
+            "chunk_index": chunk_index,
+            "section": section,
         })
     return sources
 
@@ -410,22 +447,22 @@ async def chat(request: ChatRequest, req: Request):
             async for event in graph.astream_events(initial_state, config, version="v2"):
                 kind = event["event"]
 
-                # --- DEBUG: 打印所有 on_chain_start / on_chain_end 事件以分析 LangGraph 1.x 事件结构 ---
-                if kind in ("on_chain_start", "on_chain_end"):
-                    name = event.get("name", "")
-                    tag = event.get("tags", [])
-                    meta = event.get("metadata", {})
-                    print(f"[DEBUG] {kind}: name={name!r}, tags={tag!r}, meta_keys={list(meta.keys())!r}", file=sys.stderr, flush=True)
+                # DEBUG 打印已注释，需要时取消注释以分析 LangGraph 事件结构
+                # if kind in ("on_chain_start", "on_chain_end"):
+                #     name = event.get("name", "")
+                #     tag = event.get("tags", [])
+                #     meta = event.get("metadata", {})
+                #     print(f"[DEBUG] {kind}: name={name!r}, tags={tag!r}, meta_keys={list(meta.keys())!r}", file=sys.stderr, flush=True)
 
                 if kind == "on_chain_start":
                     name = event.get("name", "")
                     meta = event.get("metadata", {})
-                    # 尝试多种方式提取节点名
                     node = meta.get("langgraph_node", "") or name
-                    # 如果 name 本身就是 agent 节点名，直接用
                     if not node or node not in AGENT_NODES:
                         if name in AGENT_NODES:
                             node = name
+                        elif name.endswith("_node") and name[:-5] in AGENT_NODES:
+                            node = name[:-5]
                     if node in AGENT_NODES:
                         current_agent = node
                         yield f"data: {json.dumps({'type': 'agent_phase', 'agent': node, 'status': 'start'}, ensure_ascii=False)}\n\n"
@@ -437,6 +474,8 @@ async def chat(request: ChatRequest, req: Request):
                     if not node or node not in AGENT_NODES:
                         if name in AGENT_NODES:
                             node = name
+                        elif name.endswith("_node") and name[:-5] in AGENT_NODES:
+                            node = name[:-5]
                     if node in AGENT_NODES:
                         yield f"data: {json.dumps({'type': 'agent_phase', 'agent': node, 'status': 'end'}, ensure_ascii=False)}\n\n"
                         current_agent = None
@@ -517,6 +556,7 @@ async def chat(request: ChatRequest, req: Request):
                     save_project_sources(request.project_id, all_sources)
                 if plan_options:
                     yield f"data: {json.dumps({'type': 'plan_options', 'options': plan_options, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+                asyncio.create_task(_background_compress(request.project_id, graph_state))
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
@@ -536,6 +576,7 @@ async def chat(request: ChatRequest, req: Request):
                 yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
             if all_sources:
                 save_project_sources(request.project_id, all_sources)
+            asyncio.create_task(_background_compress(request.project_id, graph_state))
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
         except Exception:
             # 确保无论如何都发送 done，防止前端永久显示"停止"
@@ -688,6 +729,7 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
                     yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
                 if plan_options:
                     yield f"data: {json.dumps({'type': 'plan_options', 'options': plan_options, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+                asyncio.create_task(_background_compress(request.project_id, graph_state))
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
@@ -707,6 +749,7 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
                 yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
             if all_sources:
                 save_project_sources(request.project_id, all_sources)
+            asyncio.create_task(_background_compress(request.project_id, graph_state))
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
         except Exception:
             yield f"data: {json.dumps({'type': 'done'})}\n\n"

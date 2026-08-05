@@ -742,6 +742,13 @@ input:focus, textarea:focus { border-color: var(--primary); }
   margin-bottom: 4px;
 }
 
+.source-location {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+  font-style: italic;
+}
+
 .source-domain {
   font-size: 11px;
   color: var(--primary);

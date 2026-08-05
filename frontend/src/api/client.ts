@@ -31,6 +31,9 @@ export interface SourceItem {
   summary: string;
   source_type: "web" | "paper" | "document";
   source_number: number;
+  page?: number;
+  position?: string;
+  chunk_index?: number;
 }
 
 export type SSEEvent =

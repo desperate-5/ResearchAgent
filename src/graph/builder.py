@@ -9,10 +9,9 @@ from .nodes import (
     # planner_node,      # TODO: 恢复全量时取消注释
     # reviewer_node,     # TODO: 恢复全量时取消注释
     generate_response_node,
-    memory_compressor_node,
+    # memory_compressor_node,  # 压缩已改为 server.py 后台任务，不再作为图节点
 )
-from .router import route_after_generate, route_from_supervisor_minimal as route_from_supervisor, route_after_researcher
-# TODO: 恢复全量时替换上一行为: from .router import route_after_generate, route_from_supervisor
+from .router import route_from_supervisor_minimal as route_from_supervisor, route_after_researcher
 
 
 def build_graph(checkpointer=None):
@@ -31,7 +30,7 @@ def build_graph(checkpointer=None):
     # graph.add_node("planner", planner_node)       # TODO: 恢复全量
     # graph.add_node("reviewer", reviewer_node)     # TODO: 恢复全量
     graph.add_node("generate_response", generate_response_node)
-    graph.add_node("memory_compressor", memory_compressor_node)
+    # graph.add_node("memory_compressor", memory_compressor_node)  # 压缩已改为 server.py 后台任务
 
     graph.add_edge(START, "load_context")
     graph.add_edge("load_context", "supervisor")
@@ -60,14 +59,6 @@ def build_graph(checkpointer=None):
     # graph.add_edge("planner", "supervisor")      # TODO: 恢复全量
     # graph.add_edge("reviewer", "supervisor")     # TODO: 恢复全量
 
-    graph.add_conditional_edges(
-        "generate_response",
-        route_after_generate,
-        {
-            "memory_compressor": "memory_compressor",
-            END: END,
-        },
-    )
-    graph.add_edge("memory_compressor", END)
+    graph.add_edge("generate_response", END)
 
     return graph.compile(checkpointer=checkpointer)

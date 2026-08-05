@@ -56,7 +56,10 @@ async def generate_report(project_id: str) -> str:
         src_lines = []
         for s in sources:
             sn = s.get("source_number", "?")
-            src_lines.append(f"[{sn}] {s.get('title', '')} - {s.get('url', '')}")
+            title = s.get('title', '')
+            if s.get("page") and s.get("position"):
+                title += f" (第{s['page']}页 {s['position']})"
+            src_lines.append(f"[{sn}] {title} - {s.get('url', '')}")
         if src_lines:
             user_prompt_parts.append(f"## 参考文献来源\n" + "\n".join(src_lines))
 

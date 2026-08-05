@@ -13,12 +13,13 @@ MAX_TOOL_ITERATIONS = 3
 TOOL_AGENT_MAP: dict[str, str] = {
     "web_search": "researcher",
     "aminer_search_papers": "researcher",
+    "search_uploaded_docs": "researcher",
     "python_executor": "analyst",
     "calculator": "analyst",
 }
 
 # 关键词启发式：命中即视为检索意图，直接路由到 researcher，省掉一次 LLM 调度调用
-SEARCH_KEYWORDS = ("搜索", "查找", "论文", "文献", "综述", "调研", "最新", "进展", "资料", "对比")
+SEARCH_KEYWORDS = ("搜索", "查找", "论文", "文献", "综述", "调研", "最新", "进展", "资料", "对比", "文档", "文件", "PDF", "上传", "这篇", "这份")
 
 # ============================================================
 # System Prompts
@@ -57,25 +58,17 @@ SUPERVISOR_PROMPT_MINIMAL = """你是一个多智能体系统的任务调度者�
 **重要：必须输出严格的 JSON 格式，不要添加任何其他文字。**
 {"next": "<researcher|FINISH>", "reason": "<一句话说明>"}"""
 
-RESEARCHER_PROMPT = """你是一个文献检索与信息收集专家。你的职责是搜索、收集、整理与用户问题相关的信息和文献。
+RESEARCHER_PROMPT = """你是一个文献检索与信息收集专家。使用以下工具搜索和整理信息：
 
-你可以使用以下工具：
-- web_search: 搜索互联网上的最新资讯、行业动态、博客、技术文章
-- aminer_search_papers: 搜索正式发表的学术论文（中英文），适合查找研究论文、文献综述
-- search_uploaded_docs: 搜索用户已上传的 PDF/Word 文档内容。当用户提到「我上传的文件」「这篇论文」「文档里」时使用
+- search_uploaded_docs: 搜索已上传的 PDF/Word 文档
+- web_search: 搜索互联网资讯、博客、技术文章
+- aminer_search_papers: 搜索学术论文（中英文）
 
-**核心规则（必须遵守）：**
-- 对于涉及学术、科研、技术原理、方法论的问题，第一轮必须**在同一条消息中同时发起 web_search 和 aminer_search_papers**（两个工具一起调用，不要分开两轮）
-- 这样做的目的是节省轮次，为后续换关键词补搜留出空间
-- aminer_search_papers → 正式发表的学术论文（peer-reviewed papers）
-- web_search → 行业资讯、技术博客、开源项目、新闻等非论文来源
-- 仅当用户明确只问「最新消息」「新闻」「热点」等纯资讯类问题时，才只调 web_search
-- 用户提到上传的文档或文件内容 → 用 search_uploaded_docs
-- 如果第一次搜索不够全面，下一轮换不同的搜索词补充
-- 如实汇报每个结果的来源、标题、摘要，保留工具的原始编号
-- 用中文整理和总结搜索结果
-- 不要对结果进行批判性评估（这由 reviewer 负责）
-- 如果没有找到相关信息，如实告知"""
+**规则：**
+- 上下文中有「项目已上传文件」且用户问及文件内容时，必须先调 search_uploaded_docs
+- 上传文档内容足够回答时不再联网；需要最新信息或文档不足时补充 web_search/aminer_search_papers
+- 纯学术问题同时搜 web_search + aminer_search_papers；纯新闻热点只调 web_search
+- 用中文整理结果，保留工具原始编号，如实汇报来源，不批判评估"""
 
 ANALYST_PROMPT = """你是一个数据分析与计算专家。你的职责是进行数学计算、统计分析和数据可视化。
 

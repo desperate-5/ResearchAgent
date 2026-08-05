@@ -30,6 +30,7 @@ const AGENT_LABELS: Record<string, string> = {
 const TOOL_OPTIONS = [
   { id: "web_search", label: "网络搜索" },
   { id: "aminer_search_papers", label: "学术论文" },
+  { id: "search_uploaded_docs", label: "上传文档" },
   { id: "python_executor", label: "数据画图" },
 ];
 
@@ -301,8 +302,9 @@ export default function ChatPage() {
               return next;
             });
           } else if (event.type === "done") {
-            // 流结束，清除所有运行中的 agent 状态
             setActiveAgents(new Set());
+            setStreaming(false);
+            // 异步任务（如记忆压缩）可能在 done 后继续，但 UI 已完成
           }
         },
         abort.signal,
@@ -420,6 +422,7 @@ export default function ChatPage() {
             });
           } else if (event.type === "done") {
             setActiveAgents(new Set());
+            setStreaming(false);
           }
         },
         abort.signal,
