@@ -47,7 +47,6 @@ NODES = {
     "load_context": "加载上下文",
     "supervisor": "调度决策",
     "researcher": "文献检索",
-    "analyst": "数据分析",
     "planner": "方案设计",
     "reviewer": "学术评审",
     "generate_response": "生成回答",

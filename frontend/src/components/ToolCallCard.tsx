@@ -10,14 +10,11 @@ const TOOL_LABELS: Record<string, string> = {
   web_search: "网络搜索",
   aminer_search_papers: "学术论文检索",
   search_uploaded_docs: "文档检索",
-  calculator: "数学计算",
-  python_executor: "数据分析",
 };
 
 const AGENT_LABELS: Record<string, string> = {
   supervisor: "分析调度",
   researcher: "检索文献",
-  analyst: "分析数据",
   planner: "方案设计",
   reviewer: "评审结果",
   generate_response: "生成回答",

@@ -21,7 +21,6 @@ interface ToolCallEvent {
 const AGENT_LABELS: Record<string, string> = {
   supervisor: "分析调度",
   researcher: "检索文献",
-  analyst: "分析数据",
   planner: "方案设计",
   reviewer: "评审结果",
   generate_response: "生成回答",
@@ -31,7 +30,6 @@ const TOOL_OPTIONS = [
   { id: "web_search", label: "网络搜索" },
   { id: "aminer_search_papers", label: "学术论文" },
   { id: "search_uploaded_docs", label: "上传文档" },
-  { id: "python_executor", label: "数据画图" },
 ];
 
 interface ChatMessage {
@@ -59,6 +57,7 @@ export default function ChatPage() {
   const messagesEnd = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const sendingRef = useRef(false);
   const messageIndexRef = useRef(0);
 
   // load project name and history
@@ -202,7 +201,8 @@ export default function ChatPage() {
   }, [isDragging]);
 
   const handleSend = useCallback(async () => {
-    if (!input.trim() || streaming || !projectId) return;
+    if (!input.trim() || sendingRef.current || !projectId) return;
+    sendingRef.current = true;
 
     const userMsg: ChatMessage = { role: "user", content: input, toolCalls: [] };
     setMessages((prev) => [...prev, userMsg]);
@@ -292,6 +292,15 @@ export default function ChatPage() {
                 .map((s) => ({ ...s, message_index: mi }));
               return newSources.length > 0 ? [...prev, ...newSources] : prev;
             });
+          } else if (event.type === "source_ratings") {
+            setSources((prev) =>
+              prev.map((s) => {
+                const rating = event.ratings.find(
+                  (r) => r.source_number === s.source_number,
+                );
+                return rating ? { ...s, credibility: rating.credibility } : s;
+              }),
+            );
           } else if (event.type === "plan_options") {
             setPlanOptions(event.options);
             setPlanMessageIndex(event.message_index);
@@ -323,13 +332,15 @@ export default function ChatPage() {
       });
     } finally {
       setStreaming(false);
+      sendingRef.current = false;
       abortRef.current = null;
       messageIndexRef.current = currentMsgIndex + 1;
     }
-  }, [input, streaming, projectId, selectedTools]);
+  }, [input, projectId, selectedTools]);
 
   const handlePlanSelect = useCallback(async (chosenPlanId: string, customPlanText: string) => {
-    if (!projectId) return;
+    if (!projectId || sendingRef.current) return;
+    sendingRef.current = true;
 
     // 清除弹窗，进入等待状态
     setPlanOptions(null);
@@ -411,6 +422,15 @@ export default function ChatPage() {
                 .map((s) => ({ ...s, message_index: mi }));
               return newSources.length > 0 ? [...prev, ...newSources] : prev;
             });
+          } else if (event.type === "source_ratings") {
+            setSources((prev) =>
+              prev.map((s) => {
+                const rating = event.ratings.find(
+                  (r) => r.source_number === s.source_number,
+                );
+                return rating ? { ...s, credibility: rating.credibility } : s;
+              }),
+            );
           } else if (event.type === "plan_options") {
             // 防御：如果 resume 后又触发了 planner interrupt
             setPlanOptions(event.options);
@@ -440,6 +460,7 @@ export default function ChatPage() {
       });
     } finally {
       setStreaming(false);
+      sendingRef.current = false;
       abortRef.current = null;
       messageIndexRef.current = currentMsgIndex + 1;
     }
@@ -447,6 +468,7 @@ export default function ChatPage() {
 
   const handleStop = () => {
     abortRef.current?.abort();
+    sendingRef.current = false;
   };
 
   const toggleTool = (toolId: string) => {

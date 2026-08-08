@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 class ChatRequest(BaseModel):
     project_id: str = Field(..., description="项目 ID")
     message: str = Field(..., description="用户当前消息")
-    tools: list[str] = Field(default=[], description="用户选择的工具列表，如 ['web_search', 'python_executor']")
+    tools: list[str] = Field(default=[], description="用户选择的工具列表，如 ['web_search', 'aminer_search_papers']")
 
 
 class CreateProjectRequest(BaseModel):

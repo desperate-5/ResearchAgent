@@ -3,8 +3,8 @@
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
 from .state import AgentState
 from .prompts import (
-    SUPERVISOR_PROMPT_MINIMAL,  # TODO: 恢复全量时改为 SUPERVISOR_PROMPT
-    # SUPERVISOR_PROMPT,        # TODO: 恢复全量时取消注释并替换上一行
+    SUPERVISOR_PROMPT,
+    SUPERVISOR_PROMPT_MINIMAL,
     REVIEWER_PROMPT,
     PLANNER_PROMPT,
     GENERATE_PROMPT,
@@ -39,7 +39,13 @@ def build_supervisor_context(state: AgentState) -> list:
 
     # 拼接系统提示 + 动态上下文（摘要、偏好等）
     context = state.get("system_prompt", "")
-    prompt = SUPERVISOR_PROMPT_MINIMAL  # TODO: 恢复全量时改为 SUPERVISOR_PROMPT
+    agent_outputs = state.get("agent_outputs", {})
+
+    # 有 agent 输出时已经是第二轮调度，用精简 prompt 省 token（减少 LLM 处理时间 ~0.5s）
+    if agent_outputs:
+        prompt = SUPERVISOR_PROMPT_MINIMAL
+    else:
+        prompt = SUPERVISOR_PROMPT
     if context:
         prompt += f"\n\n## 当前上下文\n{context}"
 
@@ -65,7 +71,6 @@ def build_supervisor_context(state: AgentState) -> list:
     msgs = [SystemMessage(content=prompt)] + recent
 
     # 如果已有 agent 输出，加入提示
-    agent_outputs = state.get("agent_outputs", {})
     if agent_outputs:
         summary_lines = ["## 已完成的专家分析"]
         for name, output in agent_outputs.items():
@@ -84,36 +89,51 @@ def build_supervisor_context(state: AgentState) -> list:
 
 
 def build_reviewer_context(state: AgentState) -> list:
-    """构建 reviewer 的消息列表：系统提示 + 原始用户问题 + researcher 输出 + analyst 输出。"""
+    """构建 reviewer 的消息列表：系统提示 + 原始用户问题 + researcher 输出 + 结构化来源列表。"""
     recent = get_recent_messages(state)
 
     researcher_output = state.get("agent_outputs", {}).get("researcher", "")
+    ref_sources = state.get("reference_sources", [])
 
     msgs = [SystemMessage(content=REVIEWER_PROMPT)]
 
-    # 添加原始用户问题
     user_questions = [m for m in recent if hasattr(m, "type") and m.type == "human"]
     if user_questions:
         msgs.append(SystemMessage(content=f"## 用户的原始问题\n{user_questions[-1].content}"))
 
-    # 添加 researcher 和其他 agent 的输出
     if researcher_output:
         msgs.append(SystemMessage(content=f"## 文献检索结果（需要你评估）\n{researcher_output}"))
 
-    # 也加入 analyst 输出（如果有）
-    analyst_output = state.get("agent_outputs", {}).get("analyst", "")
-    if analyst_output:
-        msgs.append(SystemMessage(content=f"## 数据分析结果\n{analyst_output}"))
+    if ref_sources:
+        source_lines = []
+        for s in ref_sources:
+            num = s.get("source_number", "?")
+            title = s.get("title", "")
+            url = s.get("url", "")
+            stype = s.get("source_type", "")
+            domain = ""
+            if url:
+                try:
+                    from urllib.parse import urlparse
+                    domain = urlparse(url).hostname or ""
+                except Exception:
+                    pass
+            line = f"[{num}] {title} | 类型:{stype}"
+            if domain:
+                line += f" | 域名:{domain}"
+            if url:
+                line += f" | {url}"
+            source_lines.append(line)
+        msgs.append(SystemMessage(content="## 来源列表（结构化）\n" + "\n".join(source_lines)))
 
     return msgs
 
 
 def build_planner_context(state: AgentState) -> list:
-    """构建 planner 的消息列表：系统提示 + researcher 输出 + analyst 输出。"""
+    """构建 planner 的消息列表：系统提示 + researcher 输出。"""
     recent = get_recent_messages(state)
 
     researcher_output = state.get("agent_outputs", {}).get("researcher", "")
-    analyst_output = state.get("agent_outputs", {}).get("analyst", "")
 
     msgs = [SystemMessage(content=PLANNER_PROMPT)]
 
@@ -125,10 +145,6 @@ def build_planner_context(state: AgentState) -> list:
     # 添加 researcher 输出
     if researcher_output:
         msgs.append(SystemMessage(content=f"## 文献检索结果\n{researcher_output}"))
-
-    # 添加 analyst 输出（如果有）
-    if analyst_output:
-        msgs.append(SystemMessage(content=f"## 数据分析结果\n{analyst_output}"))
 
     return msgs
 
@@ -173,16 +189,27 @@ def build_generate_context(state: AgentState) -> list:
                     ref_lines.append(f"[{sn}] {title}")
             parts.append(f"## 参考文献编号对照\n" + "\n".join(ref_lines))
             parts.append("**引用来源时请使用「参考文献编号对照」中的全局编号 [N]。不要使用各工具输出中的原始序号。**")
-    if agent_outputs.get("analyst"):
-        out = agent_outputs["analyst"]
-        if len(out) > MAX_AGENT_OUTPUT:
-            out = out[:MAX_AGENT_OUTPUT] + "\n\n[分析结果过长已截断]"
-        parts.append(f"## 数据分析结果\n{out}")
     if agent_outputs.get("reviewer"):
         out = agent_outputs["reviewer"]
-        if len(out) > MAX_AGENT_OUTPUT:
-            out = out[:MAX_AGENT_OUTPUT] + "\n\n[评审意见过长已截断]"
-        parts.append(f"## 学术评审意见\n{out}")
+        # 去掉开头的 JSON 评级数组，只保留文字评估（用括号计数找匹配的 ]）
+        idx = out.lstrip().find('[')
+        if idx != -1 and idx < 5:
+            depth = 0
+            end = -1
+            for i in range(idx, len(out)):
+                if out[i] == '[':
+                    depth += 1
+                elif out[i] == ']':
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end != -1:
+                out = out[end + 1:].strip()
+        if out:
+            if len(out) > MAX_AGENT_OUTPUT:
+                out = out[:MAX_AGENT_OUTPUT] + "\n\n[评审意见过长已截断]"
+            parts.append(f"## 来源可信度评估\n{out}")
     if agent_outputs.get("planner"):
         out = agent_outputs["planner"]
         if len(out) > MAX_AGENT_OUTPUT:

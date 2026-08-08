@@ -17,6 +17,9 @@ class AgentState(TypedDict):
     required_tools: list[str]   # 用户指定的工具列表，supervisor 需确保调度对应 agent
     reference_sources: list[dict]  # 本轮从工具输出中解析的来源（含全局编号）
 
+    # reviewer 来源评级字段
+    source_ratings: list[dict]   # reviewer 输出的来源可信度评级 [{source_number, credibility, reason}, ...]
+
     # planner 人机协同字段
     plan_options: list[dict]      # planner 生成的候选方案 [{id, title, description, pros, cons}, ...]
     chosen_plan_id: str            # 用户选择的预制方案 ID（空字符串表示未选预制方案）

@@ -34,6 +34,13 @@ export interface SourceItem {
   page?: number;
   position?: string;
   chunk_index?: number;
+  credibility?: "高" | "中" | "低";
+}
+
+export interface SourceRating {
+  source_number: number;
+  credibility: "高" | "中" | "低";
+  reason?: string;
 }
 
 export type SSEEvent =
@@ -41,6 +48,7 @@ export type SSEEvent =
   | { type: "tool_call"; tool: string; status: "start" | "end"; agent?: string }
   | { type: "agent_phase"; agent: string; status: "start" | "end" }
   | { type: "source"; sources: SourceItem[]; message_index: number }
+  | { type: "source_ratings"; ratings: SourceRating[]; message_index: number }
   | { type: "plan_options"; options: PlanOption[]; message_index: number }
   | { type: "done" };
 

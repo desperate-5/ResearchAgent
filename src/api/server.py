@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
@@ -58,10 +57,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Research Assistant Agent", lifespan=lifespan)
-
-# 确保 plots 目录存在
-os.makedirs(os.path.join("data", "plots"), exist_ok=True)
-app.mount("/plots", StaticFiles(directory=os.path.join("data", "plots")), name="plots")
 
 
 # ============================================================
@@ -380,6 +375,22 @@ def _parse_tool_sources(tool_name: str, output_text: str) -> list[dict]:
     return []
 
 
+def _merge_ratings_into_sources(all_sources, ratings):
+    """将可信度评价合并到 sources 中，确保持久化后刷新页面不丢失。"""
+    if not ratings:
+        return
+    rating_map = {}
+    for r in ratings:
+        sn = r.get("source_number")
+        if sn is not None:
+            rating_map[sn] = {"credibility": r.get("credibility", "中"), "reason": r.get("reason", "")}
+    for s in all_sources:
+        sn = s.get("source_number")
+        if sn in rating_map:
+            s["credibility"] = rating_map[sn]["credibility"]
+            s["reason"] = rating_map[sn]["reason"]
+
+
 def _merge_state_sources(graph_state, source_number_map, source_counter, message_index, all_sources):
     """从 graph state 的 reference_sources 中读取来源，合并到 all_sources。"""
     state_values = graph_state.values if hasattr(graph_state, "values") else {}
@@ -423,6 +434,7 @@ async def chat(request: ChatRequest, req: Request):
         "supervisor_log": [],
         "required_tools": request.tools,
         "reference_sources": [],
+        "source_ratings": [],
         "plan_options": [],
         "chosen_plan_id": "",
         "chosen_plan_detail": {},
@@ -432,7 +444,8 @@ async def chat(request: ChatRequest, req: Request):
     config = {"configurable": {"thread_id": request.project_id}}
     graph = req.app.state.graph
 
-    AGENT_NODES = {"supervisor", "researcher", "analyst", "planner", "reviewer", "generate_response"}
+    AGENT_NODES = {"supervisor", "researcher", "planner", "reviewer", "generate_response"}
+
 
     async def event_stream():
         full_response = ""
@@ -485,7 +498,8 @@ async def chat(request: ChatRequest, req: Request):
                     if chunk.content:
                         if current_agent == "generate_response":
                             full_response += chunk.content
-                        yield f"data: {json.dumps({'type': 'response', 'content': chunk.content, 'agent': current_agent}, ensure_ascii=False)}\n\n"
+                            yield f"data: {json.dumps({'type': 'response', 'content': chunk.content, 'agent': current_agent}, ensure_ascii=False)}\n\n"
+                        # 其他 agent 的 LLM 输出不推送到前端，避免泄露内部决策文本
 
                 elif kind == "on_tool_start":
                     meta = event.get("metadata", {})
@@ -552,8 +566,13 @@ async def chat(request: ChatRequest, req: Request):
                 state_sources = _merge_state_sources(graph_state, source_number_map, source_counter, message_index, all_sources)
                 if state_sources:
                     yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+                state_values = graph_state.values if hasattr(graph_state, "values") else {}
+                ratings = state_values.get("source_ratings", [])
+                _merge_ratings_into_sources(all_sources, ratings)
                 if all_sources:
                     save_project_sources(request.project_id, all_sources)
+                if ratings:
+                    yield f"data: {json.dumps({'type': 'source_ratings', 'ratings': ratings, 'message_index': message_index}, ensure_ascii=False)}\n\n"
                 if plan_options:
                     yield f"data: {json.dumps({'type': 'plan_options', 'options': plan_options, 'message_index': message_index}, ensure_ascii=False)}\n\n"
                 asyncio.create_task(_background_compress(request.project_id, graph_state))
@@ -574,6 +593,11 @@ async def chat(request: ChatRequest, req: Request):
             state_sources = _merge_state_sources(graph_state, source_number_map, source_counter, message_index, all_sources)
             if state_sources:
                 yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+            state_values = graph_state.values if hasattr(graph_state, "values") else {}
+            ratings = state_values.get("source_ratings", [])
+            if ratings:
+                yield f"data: {json.dumps({'type': 'source_ratings', 'ratings': ratings, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+            _merge_ratings_into_sources(all_sources, ratings)
             if all_sources:
                 save_project_sources(request.project_id, all_sources)
             asyncio.create_task(_background_compress(request.project_id, graph_state))
@@ -619,7 +643,8 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
     if plan_detail:
         save_project_plan(request.project_id, request.chosen_plan_id, plan_title, plan_detail, is_custom)
 
-    AGENT_NODES = {"supervisor", "researcher", "analyst", "planner", "reviewer", "generate_response"}
+    AGENT_NODES = {"supervisor", "researcher", "planner", "reviewer", "generate_response"}
+
 
     async def event_stream():
         full_response = ""
@@ -647,6 +672,8 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
                     if not node or node not in AGENT_NODES:
                         if name in AGENT_NODES:
                             node = name
+                        elif name.endswith("_node") and name[:-5] in AGENT_NODES:
+                            node = name[:-5]
                     if node in AGENT_NODES:
                         current_agent = node
                         yield f"data: {json.dumps({'type': 'agent_phase', 'agent': node, 'status': 'start'}, ensure_ascii=False)}\n\n"
@@ -658,6 +685,8 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
                     if not node or node not in AGENT_NODES:
                         if name in AGENT_NODES:
                             node = name
+                        elif name.endswith("_node") and name[:-5] in AGENT_NODES:
+                            node = name[:-5]
                     if node in AGENT_NODES:
                         yield f"data: {json.dumps({'type': 'agent_phase', 'agent': node, 'status': 'end'}, ensure_ascii=False)}\n\n"
                         current_agent = None
@@ -667,7 +696,8 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
                     if chunk.content:
                         if current_agent == "generate_response":
                             full_response += chunk.content
-                        yield f"data: {json.dumps({'type': 'response', 'content': chunk.content, 'agent': current_agent}, ensure_ascii=False)}\n\n"
+                            yield f"data: {json.dumps({'type': 'response', 'content': chunk.content, 'agent': current_agent}, ensure_ascii=False)}\n\n"
+                        # 其他 agent 的 LLM 输出不推送到前端，避免泄露内部决策文本
 
                 elif kind == "on_tool_start":
                     meta = event.get("metadata", {})
@@ -747,6 +777,11 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
             state_sources = _merge_state_sources(graph_state, source_number_map, source_counter, message_index, all_sources)
             if state_sources:
                 yield f"data: {json.dumps({'type': 'source', 'sources': state_sources, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+            state_values = graph_state.values if hasattr(graph_state, "values") else {}
+            ratings = state_values.get("source_ratings", [])
+            if ratings:
+                yield f"data: {json.dumps({'type': 'source_ratings', 'ratings': ratings, 'message_index': message_index}, ensure_ascii=False)}\n\n"
+            _merge_ratings_into_sources(all_sources, ratings)
             if all_sources:
                 save_project_sources(request.project_id, all_sources)
             asyncio.create_task(_background_compress(request.project_id, graph_state))

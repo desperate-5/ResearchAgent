@@ -25,6 +25,12 @@ function getDomain(url: string): string {
   }
 }
 
+const CREDIBILITY_STYLE: Record<string, { bg: string; color: string; label: string }> = {
+  "高": { bg: "#dcfce7", color: "#166534", label: "高可信" },
+  "中": { bg: "#fef9c3", color: "#854d0e", label: "中可信" },
+  "低": { bg: "#ffedd5", color: "#9a3412", label: "低可信" },
+};
+
 export default function SourcesPanel({ sources, onJumpToMessage, highlightIndex }: SourcesPanelProps) {
   const listRef = useRef<HTMLDivElement>(null);
 
@@ -58,6 +64,17 @@ export default function SourcesPanel({ sources, onJumpToMessage, highlightIndex 
               <div className="source-header-row">
                 <span className="source-number">{displayNum}</span>
                 <span className="source-type-badge">{TYPE_LABELS[s.source_type] || s.source_type}</span>
+                {s.credibility && CREDIBILITY_STYLE[s.credibility] && (
+                  <span
+                    className="credibility-badge"
+                    style={{
+                      background: CREDIBILITY_STYLE[s.credibility].bg,
+                      color: CREDIBILITY_STYLE[s.credibility].color,
+                    }}
+                  >
+                    {CREDIBILITY_STYLE[s.credibility].label}
+                  </span>
+                )}
               </div>
               <div className="source-title" title={s.title}>
                 {s.title}

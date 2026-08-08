@@ -1,39 +1,32 @@
 import os
+import sys
 import json
 import re
 import asyncio
 import hashlib
+import httpx
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, ToolMessage, RemoveMessage
+from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
 from .state import AgentState
 
 from ..tools.web_search import web_search
 from ..tools.aminer_search import aminer_search_papers
-from ..tools.calculator import calculator
-from ..tools.python_executor import python_executor
 from ..tools.file_rag import search_chunks
-from ..memory.compressor import generate_summary
-from ..memory.store import save_summary, get_latest_plan
+from ..memory.store import get_latest_plan
 from ..preferences.manager import get_preferences
 from ..preferences.prompt_builder import build_preference_prompt
 
 from .prompts import (
-    MAX_CONTEXT_TURNS,
-    COMPRESSION_TURN_THRESHOLD,
     MAX_TOOL_ITERATIONS,
-    TOOL_AGENT_MAP,
-    SEARCH_KEYWORDS,
     RESEARCHER_PROMPT,
-    ANALYST_PROMPT,
     PLANNER_PROMPT,
+    PLAN_KEYWORDS,
 )
 from .context import (
     get_recent_messages,
-    count_turns,
-    last_n_turns,
     build_supervisor_context,
     build_reviewer_context,
     build_planner_context,
@@ -57,11 +50,9 @@ def get_llm(streaming: bool = False) -> ChatOpenAI:
 # ============================================================
 
 RESEARCHER_TOOLS = [web_search, aminer_search_papers]
-ANALYST_TOOLS = [calculator, python_executor]
 REVIEWER_TOOLS = []
 
-# 当前图中实际注册的 agent（最小模式仅 researcher；恢复全量时补全 analyst/planner/reviewer）
-AVAILABLE_AGENTS = {"researcher"}
+AVAILABLE_AGENTS = {"researcher", "planner"}
 
 
 # ============================================================
@@ -102,11 +93,10 @@ async def load_context_node(state: AgentState) -> dict:
 
 
 async def supervisor_node(state: AgentState) -> dict:
-    """调度者节点：纯规则调度，不调用 LLM。
+    """调度者节点：LLM 驱动的智能调度。
 
-    1) 用户指定了工具约束 → 按 TOOL_AGENT_MAP 映射到对应 agent（未执行过的优先）；
-    2) 否则用关键词判断是否需要文献检索；
-    3) 都不需要 → FINISH。
+    由 LLM 根据用户问题、已有 agent 输出、工具约束等上下文，自主决定
+    调用 researcher / planner / reviewer 或 FINISH。
     """
     log = state.get("supervisor_log", [])
     agent_outputs = state.get("agent_outputs", {})
@@ -125,39 +115,108 @@ async def supervisor_node(state: AgentState) -> dict:
             "supervisor_log": log + [{"next": "FINISH", "reason": "planner 已完成方案设计，结束调度"}],
         }
 
-    # ─── 用户明确指定了工具：按映射直接调度，无需 LLM 判断 ───
-    required_tools = state.get("required_tools", [])
-    if required_tools:
-        for tool_name in required_tools:
-            agent = TOOL_AGENT_MAP.get(tool_name)
-            if agent not in AVAILABLE_AGENTS:
-                continue
-            if agent not in agent_outputs:
-                return {
-                    "next_agent": agent,
-                    "supervisor_log": log + [{"next": agent, "reason": f"用户指定工具 {tool_name}"}],
-                }
-        return {
-            "next_agent": "FINISH",
-            "supervisor_log": log + [{"next": "FINISH", "reason": "用户指定工具均已执行"}],
-        }
+    # 关键词启发式：用户明确要求设计研究方案，且 researcher 已有输出 → 强制路由到 planner
+    if "researcher" in agent_outputs:
+        user_query = _extract_user_query(state)
+        matched_kw = [kw for kw in PLAN_KEYWORDS if kw in user_query]
+        print(f"[DEBUG supervisor] agent_outputs keys={list(agent_outputs.keys())}", file=sys.stderr, flush=True)
+        print(f"[DEBUG supervisor] user_query={user_query[:200]!r}", file=sys.stderr, flush=True)
+        print(f"[DEBUG supervisor] PLAN_KEYWORDS matched={matched_kw}", file=sys.stderr, flush=True)
+        if matched_kw:
+            print("[DEBUG supervisor] Forcing route to planner (keyword match)", file=sys.stderr, flush=True)
+            return {
+                "next_agent": "planner",
+                "supervisor_log": log + [{"next": "planner", "reason": "用户明确要求设计研究方案，强制路由到 planner"}],
+            }
+        else:
+            print("[DEBUG supervisor] No PLAN_KEYWORDS match, falling through to LLM", file=sys.stderr, flush=True)
+    else:
+        print(f"[DEBUG supervisor] agent_outputs keys={list(agent_outputs.keys())} (researcher not yet run)", file=sys.stderr, flush=True)
 
-    # ─── 无工具约束：关键词启发式判断是否需检索 ───
-    user_text = _extract_user_query(state)
-    if any(kw in user_text for kw in SEARCH_KEYWORDS):
-        return {
-            "next_agent": "researcher",
-            "supervisor_log": log + [{"next": "researcher", "reason": "问题包含检索意图关键词"}],
-        }
+    llm = get_llm()
+    msgs = build_supervisor_context(state)
+    response = await llm.ainvoke(msgs)
+    decision = _parse_decision(response.content)
 
+    next_agent = decision.get("next", "FINISH")
+    reason = decision.get("reason", "")
+
+    # 校验 next_agent 合法性
+    if next_agent not in AVAILABLE_AGENTS and next_agent != "FINISH":
+        print(f"[DEBUG supervisor] LLM returned unknown agent {decision.get('next', '')!r}, falling back to FINISH", file=sys.stderr, flush=True)
+        next_agent = "FINISH"
+        reason = f"LLM 返回了未知 agent '{decision.get('next', '')}'，回退为 FINISH"
+
+    print(f"[DEBUG supervisor] LLM decision: next={next_agent}, reason={reason!r}", file=sys.stderr, flush=True)
     return {
-        "next_agent": "FINISH",
-        "supervisor_log": log + [{"next": "FINISH", "reason": "普通问答，无需工具"}],
+        "next_agent": next_agent,
+        "supervisor_log": log + [{"next": next_agent, "reason": reason}],
     }
 
 
+def _parse_ratings(text: str) -> list[dict]:
+    """从 reviewer 输出中提取 JSON 评级数组（用括号计数匹配完整的 JSON 数组）。"""
+    idx = text.find('[')
+    if idx == -1:
+        return []
+    depth = 0
+    end = -1
+    for i in range(idx, len(text)):
+        if text[i] == '[':
+            depth += 1
+        elif text[i] == ']':
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end == -1:
+        return []
+    try:
+        ratings = json.loads(text[idx:end + 1])
+        for r in ratings:
+            r["credibility"] = r.get("credibility", "中")
+            r["source_number"] = r.get("source_number", 0)
+        return ratings
+    except json.JSONDecodeError:
+        return []
+
+
+async def _verify_source_urls(sources: list[dict], timeout: int = 5) -> list[dict]:
+    """异步 HEAD 请求检查来源 URL 可达性，返回仅保留存活来源的新列表。"""
+    urls = [s["url"] for s in sources if s.get("url")]
+    if not urls:
+        return sources
+
+    async def _check_one(client: httpx.AsyncClient, url: str) -> tuple[str, bool]:
+        try:
+            r = await client.head(url, timeout=timeout)
+            if r.status_code < 400:
+                return url, True
+            if r.status_code in (405, 400, 403):
+                r2 = await client.get(url, timeout=timeout)
+                return url, r2.status_code < 400
+            return url, False
+        except Exception:
+            return url, False
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "ResearchAssistant/1.0"},
+        follow_redirects=True,
+    ) as client:
+        tasks = [_check_one(client, u) for u in urls]
+        results = await asyncio.gather(*tasks)
+
+    alive = {url for url, ok in results if ok}
+    dead = [url for url, ok in results if not ok]
+
+    if dead:
+        print(f"[researcher] 过滤掉 {len(dead)} 个死链: {dead}", file=sys.stderr, flush=True)
+
+    return [s for s in sources if not s.get("url") or s["url"] in alive]
+
+
 async def researcher_node(state: AgentState) -> dict:
-    """文献检索 agent。LLM 决定调用哪些工具，并行执行后直接返回原始结果（不做二次总结，节省 2-5s）。"""
+    """文献检索 agent。LLM 决定调用哪些工具，并行执行后直接返回原始结果（不做二次总结）。"""
     llm = get_llm()
     user_msgs = get_recent_messages(state)
     context = state.get("system_prompt", "")
@@ -190,7 +249,14 @@ async def researcher_node(state: AgentState) -> dict:
             result = f"工具执行失败: {e}"
         return tc, result, tool_obj.name
 
-    # 用户已明确指定检索工具：直接并行执行，跳过 LLM 工具决策（省一次 LLM 往返）
+    _query = _extract_user_query(state)
+
+    # 检查是否有上传文件需要检索
+    from ..tools.file_rag import get_project_files
+    _has_uploads = len(get_project_files(project_id)) > 0
+    _mentions_files = any(kw in _query for kw in ("上传", "文档", "文件", "这篇", "这份", "PDF"))
+
+    # 用户已明确指定检索工具：直接并行执行，跳过 LLM 工具决策
     user_specified = [t for t in state.get("required_tools", [])
                       if t in ("web_search", "aminer_search_papers", "search_uploaded_docs")]
     if user_specified:
@@ -213,17 +279,47 @@ async def researcher_node(state: AgentState) -> dict:
                 output_parts.append(f"## {tool_name} 结果\n{result}")
                 _collect_sources(tool_name, result)
 
+        all_sources = await _verify_source_urls(all_sources)
+
         return {
             "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _truncate_output("\n\n".join(output_parts))},
             "reference_sources": all_sources,
         }
 
+    # 用户提及文件且有上传文件 → 优先文档检索 + 网络搜索补充
+    if _mentions_files and _has_uploads:
+        print("[DEBUG researcher] direct search (search_uploaded_docs + web_search)", file=sys.stderr, flush=True)
+        query = _extract_user_query(state)[:200]
+        tool_by_name = {t.name: t for t in tools}
+        coros = []
+        for name in ("search_uploaded_docs", "web_search"):
+            tool_obj = tool_by_name.get(name)
+            if tool_obj:
+                coros.append(_invoke_one({"id": f"file_{name}", "name": name, "args": {"query": query}}, tool_obj))
+
+        output_parts = []
+        if coros:
+            results = await asyncio.gather(*coros)
+            for tc, result, tool_name in results:
+                output_parts.append(f"## {tool_name} 结果\n{result}")
+                _collect_sources(tool_name, result)
+
+        all_sources = await _verify_source_urls(all_sources)
+
+        return {
+            "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _truncate_output("\n\n".join(output_parts))},
+            "reference_sources": all_sources,
+        }
+
+    # LLM 工具决策：由 LLM 决定调用哪些工具
     llm_with_tools = llm.bind_tools(tools)
 
     msgs = [SystemMessage(content=full_prompt)] + user_msgs
     response = await llm_with_tools.ainvoke(msgs)
 
     if not response.tool_calls:
+        print("[DEBUG researcher] LLM returned NO tool calls, returning text only (no sources)", file=sys.stderr, flush=True)
+        all_sources = await _verify_source_urls(all_sources)
         return {
             "agent_outputs": {**state.get("agent_outputs", {}), "researcher": response.content},
             "reference_sources": all_sources,
@@ -245,41 +341,34 @@ async def researcher_node(state: AgentState) -> dict:
             output_parts.append(f"## {tool_name} 结果\n{result}")
             _collect_sources(tool_name, result)
 
+    print(f"[DEBUG researcher] tool_calls={len(response.tool_calls)}, coros={len(coros)}, sources={len(all_sources)}, output_len={len(_truncate_output(chr(10).join(output_parts) if output_parts else ''))}", file=sys.stderr, flush=True)
+    all_sources = await _verify_source_urls(all_sources)
     return {
         "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _truncate_output("\n\n".join(output_parts))},
         "reference_sources": all_sources,
     }
 
 
-async def analyst_node(state: AgentState) -> dict:
-    """数据分析 agent：自带 calculator 工具循环，可基于检索结果进行计算分析。"""
-    llm = get_llm()
-    user_msgs = get_recent_messages(state)
-
-    full_prompt = ANALYST_PROMPT
-    context = state.get("system_prompt", "")
-    if context:
-        full_prompt += f"\n\n## 上下文信息\n{context}"
-
-    researcher_output = state.get("agent_outputs", {}).get("researcher", "")
-    if researcher_output:
-        full_prompt += f"\n\n## 文献检索结果（可作为分析依据）\n{researcher_output}"
-
-    content, _ = await _run_tool_loop(llm, full_prompt, user_msgs, ANALYST_TOOLS)
-
-    return {
-        "agent_outputs": {**state.get("agent_outputs", {}), "analyst": content},
-    }
-
 
 async def reviewer_node(state: AgentState) -> dict:
-    """学术评审 agent：无工具，纯推理批判性评估。"""
+    """学术评审 agent：无工具，纯推理批判性评估。输出 JSON 评级 + 简短文字。"""
+    import time
+    t0 = time.time()
     llm = get_llm()
     msgs = build_reviewer_context(state)
+    t1 = time.time()
+    total_chars = sum(len(str(m.content)) for m in msgs)
+    print(f"[DEBUG reviewer] context built in {t1 - t0:.1f}s, {len(msgs)} msgs, {total_chars} chars total", file=sys.stderr, flush=True)
     response = await llm.ainvoke(msgs)
+    t2 = time.time()
+    print(f"[DEBUG reviewer] LLM call took {t2 - t1:.1f}s, output {len(response.content)} chars", file=sys.stderr, flush=True)
+
+    ratings = _parse_ratings(response.content)
+    print(f"[DEBUG reviewer] parsed {len(ratings)} ratings", file=sys.stderr, flush=True)
 
     return {
         "agent_outputs": {**state.get("agent_outputs", {}), "reviewer": response.content},
+        "source_ratings": ratings,
     }
 
 
@@ -330,32 +419,18 @@ async def planner_node(state: AgentState) -> dict:
 
 async def generate_response_node(state: AgentState) -> dict:
     """综合所有 agent 输出，生成最终用户回复。"""
+    import time
+    t0 = time.time()
     llm = get_llm(streaming=True)
     msgs = build_generate_context(state)
+    t1 = time.time()
+    total_chars = sum(len(str(m.content)) for m in msgs)
+    print(f"[DEBUG generate] context built in {t1 - t0:.1f}s, {len(msgs)} msgs, {total_chars} chars total", file=sys.stderr, flush=True)
     response = await llm.ainvoke(msgs)
+    t2 = time.time()
+    print(f"[DEBUG generate] LLM call took {t2 - t1:.1f}s, output {len(response.content)} chars", file=sys.stderr, flush=True)
 
     return {"messages": [response]}
-
-
-async def memory_compressor_node(state: AgentState) -> dict:
-    """压缩旧对话为结构化摘要（按对话轮数判断，超过 10 轮触发），并裁剪已压缩的旧消息。"""
-    all_messages = list(state["messages"])
-
-    if count_turns(all_messages) <= COMPRESSION_TURN_THRESHOLD:
-        return {}
-
-    keep_recent_turns = 5
-    recent_msgs = last_n_turns(all_messages, keep_recent_turns)
-    old_msgs = all_messages[: len(all_messages) - len(recent_msgs)]
-
-    new_summary = await generate_summary(old_msgs, state.get("summary", ""))
-
-    save_summary(state["project_id"], new_summary)
-
-    return {
-        "summary": new_summary,
-        "messages": [RemoveMessage(id=m.id) for m in old_msgs if getattr(m, "id", None)],
-    }
 
 
 # ============================================================
