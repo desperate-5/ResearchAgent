@@ -7,8 +7,6 @@ class AgentState(TypedDict):
     project_id: str
     summary: str
     system_prompt: str
-    search_results: list[dict]
-    retrieved_docs: list[dict]
 
     # 多 Agent 新增字段
     agent_outputs: dict         # {agent_name: output_text}  各子 agent 的输出
@@ -20,8 +18,12 @@ class AgentState(TypedDict):
     # reviewer 来源评级字段
     source_ratings: list[dict]   # reviewer 输出的来源可信度评级 [{source_number, credibility, reason}, ...]
 
+    # reviewer 检索质量评估字段（功能点 1）
+    source_assessments: list[dict]  # 每条来源评分卡 [{source_number, dimension_scores, score, credibility, evidence}]
+    retrieval_gaps: list[str]       # 信息缺口子问题列表
+    search_round: int               # 已补搜次数（0 表示首轮，每次补搜 +1）
+
     # planner 人机协同字段
     plan_options: list[dict]      # planner 生成的候选方案 [{id, title, description, pros, cons}, ...]
     chosen_plan_id: str            # 用户选择的预制方案 ID（空字符串表示未选预制方案）
-    chosen_plan_detail: dict       # 用户选中方案的完整信息（从 plan_options 提取）
     custom_plan_text: str          # 用户自定义的方案文本（未选预制方案时填写）

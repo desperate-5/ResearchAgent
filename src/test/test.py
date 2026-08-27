@@ -1,10 +1,9 @@
-"""性能测试脚本：运行多 Agent 图 + 文档检索专项基准，输出耗时明细，用于回答速度优化。
+"""检索测试脚本：查看检索 agent 的工具原始结果 + 文档检索专项基准。
 
 用法（在项目根目录下运行）：
-    # 全链路图测试：定位慢在哪个节点（调度/检索/生成）
-    python src/test.py "你的测试问题"
-    python src/test.py "帮我查最新的AI Agent综述" --tools web_search aminer_search_papers
-    python src/test.py "..." --project <已有项目ID>
+    # 仅调用 researcher 检索节点，打印工具调用的原始结果（不经 LLM 总结）
+    python src/test.py "帮我查最新的AI Agent综述" --mode researcher
+    python src/test.py "帮我查最新的AI Agent综述" --mode researcher --tools web_search aminer_search_papers
 
     # 文档检索专项基准：单独测 RAG 的索引与查询速度（排查文档检索慢）
     python src/test.py "某论文里的结论是什么" --mode rag --project <项目ID> --runs 3
@@ -31,6 +30,8 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
 from src.graph.builder import build_graph
+from src.graph.nodes import researcher_node
+from src.tools.aminer_search import AMINER_API_URL, _generate_token
 from src.memory.store import init_db, get_summary
 from src.projects.manager import create_project, get_project
 from src.tools.file_rag import (
@@ -153,8 +154,6 @@ async def run_question(question: str, project_id: str, tools: list[str]) -> Time
         "project_id": project_id,
         "summary": get_summary(project_id),
         "system_prompt": "",
-        "search_results": [],
-        "retrieved_docs": [],
         "agent_outputs": {},
         "next_agent": "",
         "supervisor_log": [],
@@ -162,7 +161,6 @@ async def run_question(question: str, project_id: str, tools: list[str]) -> Time
         "reference_sources": [],
         "plan_options": [],
         "chosen_plan_id": "",
-        "chosen_plan_detail": {},
         "custom_plan_text": "",
     }
 
@@ -255,6 +253,211 @@ def print_report(tracker: TimeTracker, question: str):
         print(f"  工具调用总耗时  {total_tool:.2f}s ({total_tool / total * 100:.0f}%)")
         print(f"  本地/调度开销   {total - total_llm - total_tool:.2f}s")
     print("\n" + "=" * 62)
+
+
+def run_researcher_mode(args):
+    """--mode researcher：仅调用 researcher 检索节点，打印工具调用的原始结果（不经 LLM 总结）。"""
+    if args.project and get_project(args.project):
+        project_id = args.project
+        print(f"复用项目: {project_id}")
+    else:
+        project_id = create_project("检索测试临时项目")["id"]
+        print(f"新建临时项目: {project_id}")
+
+    state = {
+        "messages": [HumanMessage(content=args.question)],
+        "project_id": project_id,
+        "summary": get_summary(project_id),
+        "system_prompt": "",
+        "agent_outputs": {},
+        "next_agent": "",
+        "supervisor_log": [],
+        "required_tools": args.tools,
+        "reference_sources": [],
+        "plan_options": [],
+        "chosen_plan_id": "",
+        "custom_plan_text": "",
+    }
+
+    result = asyncio.run(researcher_node(state))
+
+    print("\n" + "=" * 62)
+    print(f"问题: {args.question}")
+    print("=" * 62)
+    print("\n【工具调用原始结果】")
+    researcher_output = result.get("agent_outputs", {}).get("researcher", "(researcher 无输出)")
+    print(researcher_output)
+
+    print("\n【解析出的来源】")
+    sources = result.get("reference_sources", [])
+    if not sources:
+        print("  (无来源)")
+    for s in sources:
+        print(f"  [{s.get('source_number')}] {s.get('source_type', '')} | {s.get('title', '')} | {s.get('url', '')}")
+
+    print("\n" + "=" * 62)
+
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(out_dir, f"researcher_output_{ts}.txt")
+    lines = [
+        f"问题: {args.question}",
+        "=" * 62,
+        "【工具调用原始结果】",
+        researcher_output,
+        "",
+        "【解析出的来源】",
+    ]
+    if not sources:
+        lines.append("  (无来源)")
+    for s in sources:
+        lines.append(f"  [{s.get('source_number')}] {s.get('source_type', '')} | {s.get('title', '')} | {s.get('url', '')}")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"\n检索结果已写入: {out_path}")
+
+
+def run_to_researcher_mode(args):
+    """--mode to_researcher：从图输入跑到检索模块（load_context → supervisor → researcher），
+    在 reviewer 节点前停下，打印检索模块的最终输出（不涉及审查/计划等后续环节）。"""
+    if args.project and get_project(args.project):
+        project_id = args.project
+        print(f"复用项目: {project_id}")
+    else:
+        project_id = create_project("检索链路测试临时项目")["id"]
+        print(f"新建临时项目: {project_id}")
+
+    initial_state = {
+        "messages": [HumanMessage(content=args.question)],
+        "project_id": project_id,
+        "summary": get_summary(project_id),
+        "system_prompt": "",
+        "agent_outputs": {},
+        "next_agent": "",
+        "supervisor_log": [],
+        "required_tools": args.tools,
+        "reference_sources": [],
+        "plan_options": [],
+        "chosen_plan_id": "",
+        "custom_plan_text": "",
+    }
+    config = {"configurable": {"thread_id": project_id}}
+
+    async def _run():
+        graph = build_graph(checkpointer=MemorySaver())
+        return await graph.ainvoke(initial_state, config, interrupt_before=["reviewer"])
+
+    final_state = asyncio.run(_run())
+
+    print("\n" + "=" * 62)
+    print(f"问题: {args.question}")
+    print("=" * 62)
+
+    print("\n【已执行节点】load_context → supervisor → researcher（已在 reviewer 前停下）")
+
+    print("\n【调度记录】")
+    log = final_state.get("supervisor_log", [])
+    if not log:
+        print("  (无)")
+    for entry in log:
+        print(f"  next={entry.get('next')} | {entry.get('reason', '')}")
+
+    print("\n【检索模块 (researcher) 最终输出】")
+    researcher_output = final_state.get("agent_outputs", {}).get("researcher", "")
+    if researcher_output:
+        print(researcher_output)
+    else:
+        print("  (researcher 未执行：supervisor 未路由到检索，请查看上方调度记录)")
+
+    print("\n【解析出的来源】")
+    sources = final_state.get("reference_sources", [])
+    if not sources:
+        print("  (无来源)")
+    for s in sources:
+        print(f"  [{s.get('source_number')}] {s.get('source_type', '')} | {s.get('title', '')} | {s.get('url', '')}")
+
+    print("\n" + "=" * 62)
+
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(out_dir, f"researcher_flow_{ts}.txt")
+    lines = [
+        f"问题: {args.question}",
+        "=" * 62,
+        "【调度记录】",
+    ]
+    for entry in log:
+        lines.append(f"  next={entry.get('next')} | {entry.get('reason', '')}")
+    lines.append("")
+    lines.append("【检索模块 (researcher) 最终输出】")
+    lines.append(researcher_output if researcher_output else "  (researcher 未执行)")
+    lines.append("")
+    lines.append("【解析出的来源】")
+    if not sources:
+        lines.append("  (无来源)")
+    for s in sources:
+        lines.append(f"  [{s.get('source_number')}] {s.get('source_type', '')} | {s.get('title', '')} | {s.get('url', '')}")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"\n检索链路结果已写入: {out_path}")
+
+
+async def _invoke_tool_safely(tool, args: dict) -> str:
+    try:
+        return str(await tool.ainvoke(args))
+    except Exception as e:
+        return f"工具执行失败: {e}"
+
+
+async def _run_tools_compare(question: str, project_id: str) -> dict:
+    """分别调用三种检索方式，独立收集各自结果。"""
+    from src.tools.web_search import web_search
+    from src.tools.aminer_search import aminer_search_papers
+    from src.graph.nodes import _make_rag_tool
+
+    doc_tool = _make_rag_tool(project_id)
+    tasks = {
+        "web_search": _invoke_tool_safely(web_search, {"query": question}),
+        "aminer_search_papers": _invoke_tool_safely(aminer_search_papers, {"query": question, "count": 10}),
+        "search_uploaded_docs": _invoke_tool_safely(doc_tool, {"query": question}),
+    }
+    return {name: await coro for name, coro in tasks.items()}
+
+
+def run_compare_mode(args):
+    """--mode compare：输入问题，分别调用三种检索方式并独立展示各自结果。"""
+    if args.project and get_project(args.project):
+        project_id = args.project
+        print(f"复用项目: {project_id}")
+    else:
+        project_id = create_project("检索对比临时项目")["id"]
+        print(f"新建临时项目: {project_id}")
+
+    results = asyncio.run(_run_tools_compare(args.question, project_id))
+
+    labels = {
+        "web_search": "网络搜索 (web_search)",
+        "aminer_search_papers": "学术论文搜索 (aminer_search_papers)",
+        "search_uploaded_docs": "上传文档检索 (search_uploaded_docs)",
+    }
+
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(out_dir, f"retrieval_compare_{ts}.txt")
+    lines = [f"问题: {args.question}", "=" * 62]
+
+    for name in labels:
+        print("\n" + "=" * 62)
+        print(f"【{labels[name]}】")
+        print("=" * 62)
+        print(results[name])
+        lines.append("")
+        lines.append(f"【{labels[name]}】")
+        lines.append(results[name])
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"\n\n对比结果已写入: {out_path}")
 
 
 # ============================================================
@@ -365,6 +568,53 @@ def _bench_search(project_id: str, query: str, k: int, runs: int):
               f"平均 {statistics.mean(real_times):.2f}s | 最小 {min(real_times):.2f}s | 最大 {max(real_times):.2f}s")
 
 
+def run_aminer_debug(args):
+    """--mode aminer_debug：绕过 aminer 工具解析，直接打印 AMiner API 原始响应。"""
+    import json as _json
+    import urllib.request
+    import urllib.parse
+
+    token = _generate_token()
+    if not token:
+        print("AMiner 未配置（请在 .env 设置 AMINER_API_KEY / AMINER_USER_ID）")
+        return
+
+    params = {"keyword": args.question, "size": "10"}
+    url = f"{AMINER_API_URL}?{urllib.parse.urlencode(params)}"
+    print(f"请求 URL: {url}")
+    print(f"token 前 30 字符: {token[:30]}...")
+
+    req = urllib.request.Request(url, headers={"Authorization": token})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"请求异常: {e}")
+        return
+
+    print("\n响应顶层结构:")
+    print(f"  code: {data.get('code')}")
+    print(f"  success: {data.get('success')}")
+    print(f"  msg: {data.get('msg')}")
+    print(f"  log_id: {data.get('log_id')}")
+    print(f"  keys: {list(data.keys())}")
+    print(f"  data 类型: {type(data.get('data')).__name__}")
+
+    payload = data.get("data")
+    print(f"  data 原始内容(前 800 字符):\n  {_json.dumps(payload, ensure_ascii=False)[:800]}")
+
+    if isinstance(payload, dict):
+        print(f"\ndata 是字典，其 keys: {list(payload.keys())}")
+        items = payload.get("items") or payload.get("papers") or payload.get("list") or payload.get("records") or []
+        print(f"  可能的论文列表字段 items/papers/list/records -> {len(items)} 条")
+    elif isinstance(payload, list):
+        print(f"\ndata 是列表，共 {len(payload)} 条")
+        if payload:
+            print(f"  第一条的字段: {list(payload[0].keys()) if isinstance(payload[0], dict) else type(payload[0])}")
+            print(f"  第一条内容(前 500 字符):\n  {_json.dumps(payload[0], ensure_ascii=False)[:500]}")
+
+
+
 def run_rag_mode(args):
     """--mode rag：文档检索专项基准（索引速度 + 查询速度分解）。"""
     _install_embedding_timer()
@@ -397,8 +647,8 @@ def run_rag_mode(args):
 def main():
     parser = argparse.ArgumentParser(description="多 Agent 性能测试脚本")
     parser.add_argument("question", nargs="?", default="你好", help="要测试的问题 / rag 模式下的检索查询词")
-    parser.add_argument("--mode", choices=["graph", "rag"], default="graph",
-                        help="graph=全链路图测试; rag=文档检索专项基准")
+    parser.add_argument("--mode", choices=["graph", "rag", "researcher", "compare", "aminer_debug", "to_researcher"], default="graph",
+                        help="graph=全链路图测试; rag=文档检索专项基准; researcher=仅调用检索节点打印原始工具结果; compare=分别调用三种检索方式对比结果; aminer_debug=直接打印AMiner原始API响应; to_researcher=从图输入跑到检索模块并在reviewer前停下")
     parser.add_argument("--tools", nargs="*", default=[],
                         help="用户指定的工具约束，如 web_search aminer_search_papers search_uploaded_docs")
     parser.add_argument("--project", default="", help="复用已有项目 ID（默认每次新建临时项目）")
@@ -413,6 +663,22 @@ def main():
 
     if args.mode == "rag":
         run_rag_mode(args)
+        return
+
+    if args.mode == "researcher":
+        run_researcher_mode(args)
+        return
+
+    if args.mode == "to_researcher":
+        run_to_researcher_mode(args)
+        return
+
+    if args.mode == "compare":
+        run_compare_mode(args)
+        return
+
+    if args.mode == "aminer_debug":
+        run_aminer_debug(args)
         return
 
     if args.project and get_project(args.project):

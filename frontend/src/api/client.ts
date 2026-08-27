@@ -31,7 +31,9 @@ export interface SourceItem {
   summary: string;
   source_type: "web" | "paper" | "document";
   source_number: number;
+  published?: string;
   page?: number;
+  section?: string;
   position?: string;
   chunk_index?: number;
   credibility?: "高" | "中" | "低";

@@ -5,7 +5,6 @@ from .state import AgentState
 from .prompts import (
     SUPERVISOR_PROMPT,
     SUPERVISOR_PROMPT_MINIMAL,
-    REVIEWER_PROMPT,
     PLANNER_PROMPT,
     GENERATE_PROMPT,
     MAX_CONTEXT_TURNS,
@@ -88,47 +87,6 @@ def build_supervisor_context(state: AgentState) -> list:
     return msgs
 
 
-def build_reviewer_context(state: AgentState) -> list:
-    """构建 reviewer 的消息列表：系统提示 + 原始用户问题 + researcher 输出 + 结构化来源列表。"""
-    recent = get_recent_messages(state)
-
-    researcher_output = state.get("agent_outputs", {}).get("researcher", "")
-    ref_sources = state.get("reference_sources", [])
-
-    msgs = [SystemMessage(content=REVIEWER_PROMPT)]
-
-    user_questions = [m for m in recent if hasattr(m, "type") and m.type == "human"]
-    if user_questions:
-        msgs.append(SystemMessage(content=f"## 用户的原始问题\n{user_questions[-1].content}"))
-
-    if researcher_output:
-        msgs.append(SystemMessage(content=f"## 文献检索结果（需要你评估）\n{researcher_output}"))
-
-    if ref_sources:
-        source_lines = []
-        for s in ref_sources:
-            num = s.get("source_number", "?")
-            title = s.get("title", "")
-            url = s.get("url", "")
-            stype = s.get("source_type", "")
-            domain = ""
-            if url:
-                try:
-                    from urllib.parse import urlparse
-                    domain = urlparse(url).hostname or ""
-                except Exception:
-                    pass
-            line = f"[{num}] {title} | 类型:{stype}"
-            if domain:
-                line += f" | 域名:{domain}"
-            if url:
-                line += f" | {url}"
-            source_lines.append(line)
-        msgs.append(SystemMessage(content="## 来源列表（结构化）\n" + "\n".join(source_lines)))
-
-    return msgs
-
-
 def build_planner_context(state: AgentState) -> list:
     """构建 planner 的消息列表：系统提示 + researcher 输出。"""
     recent = get_recent_messages(state)
@@ -162,14 +120,9 @@ def build_generate_context(state: AgentState) -> list:
     parts = [GENERATE_PROMPT]
     parts.append(f"## 用户的原始问题\n{user_question}")
 
-    MAX_AGENT_OUTPUT = 3000
-
     if agent_outputs.get("researcher"):
         researcher_output = agent_outputs["researcher"]
         ref_sources = state.get("reference_sources", [])
-        # 截断过长检索结果以降低首 token 延迟（TTFT 主要由 prompt 处理时间决定）
-        if len(researcher_output) > MAX_AGENT_OUTPUT:
-            researcher_output = researcher_output[:MAX_AGENT_OUTPUT] + "\n\n[检索结果过长已截断，完整信息见参考文献列表]"
         parts.append(f"## 文献检索结果\n{researcher_output}")
         if ref_sources:
             ref_lines = []
@@ -191,29 +144,10 @@ def build_generate_context(state: AgentState) -> list:
             parts.append("**引用来源时请使用「参考文献编号对照」中的全局编号 [N]。不要使用各工具输出中的原始序号。**")
     if agent_outputs.get("reviewer"):
         out = agent_outputs["reviewer"]
-        # 去掉开头的 JSON 评级数组，只保留文字评估（用括号计数找匹配的 ]）
-        idx = out.lstrip().find('[')
-        if idx != -1 and idx < 5:
-            depth = 0
-            end = -1
-            for i in range(idx, len(out)):
-                if out[i] == '[':
-                    depth += 1
-                elif out[i] == ']':
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            if end != -1:
-                out = out[end + 1:].strip()
         if out:
-            if len(out) > MAX_AGENT_OUTPUT:
-                out = out[:MAX_AGENT_OUTPUT] + "\n\n[评审意见过长已截断]"
             parts.append(f"## 来源可信度评估\n{out}")
     if agent_outputs.get("planner"):
         out = agent_outputs["planner"]
-        if len(out) > MAX_AGENT_OUTPUT:
-            out = out[:MAX_AGENT_OUTPUT] + "\n\n[方案过长已截断]"
         chosen_plan_id = state.get("chosen_plan_id", "")
         custom_plan_text = state.get("custom_plan_text", "")
         if chosen_plan_id:

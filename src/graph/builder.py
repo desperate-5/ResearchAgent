@@ -9,7 +9,7 @@ from .nodes import (
     reviewer_node,
     generate_response_node,
 )
-from .router import route_from_supervisor, route_from_researcher
+from .router import route_from_supervisor
 
 
 def build_graph(checkpointer=None):
@@ -36,15 +36,7 @@ def build_graph(checkpointer=None):
         },
     )
 
-    graph.add_conditional_edges(
-        "researcher",
-        route_from_researcher,
-        {
-            "reviewer": "reviewer",
-            "supervisor": "supervisor",
-            "generate_response": "generate_response",
-        },
-    )
+    graph.add_edge("researcher", "reviewer")
     graph.add_edge("planner", "supervisor")
     graph.add_edge("reviewer", "supervisor")
 

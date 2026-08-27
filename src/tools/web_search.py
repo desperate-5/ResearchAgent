@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import urllib.request
 
 from dotenv import load_dotenv
@@ -48,10 +49,22 @@ def web_search(query: str) -> str:
 
     lines = []
     for i, r in enumerate(web_pages, 1):
-        title = r.get("name", "无标题")
+        title = re.sub(r"\s+", " ", r.get("name", "无标题")).strip()
         url = r.get("url", "")
-        summary = r.get("summary", "")
+        summary = re.sub(r"\s+", " ", r.get("summary", "")).strip()
+        snippet = re.sub(r"\s+", " ", r.get("snippet", "")).strip()
         site = r.get("siteName", "")
-        lines.append(f"{i}. {title}\n   来源: {site} | URL: {url}\n   {summary}")
+        date_crawled = r.get("dateLastCrawled", "")
+        line = f"{i}. [web] {title}\n"
+        if site:
+            line += f"   来源: {site}\n"
+        if url:
+            line += f"   链接: {url}\n"
+        if date_crawled:
+            line += f"   附加: 发布时间: {date_crawled}\n"
+        content = summary or snippet
+        if content:
+            line += f"   内容: {content}\n"
+        lines.append(line)
 
     return "\n\n".join(lines)

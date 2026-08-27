@@ -3,11 +3,10 @@ import sys
 import json
 import re
 import asyncio
-import hashlib
 import httpx
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import SystemMessage
 from langchain_core.tools import tool
 from langgraph.types import interrupt
 from .state import AgentState
@@ -15,23 +14,24 @@ from .state import AgentState
 from ..tools.web_search import web_search
 from ..tools.aminer_search import aminer_search_papers
 from ..tools.file_rag import search_chunks
+from ..tools.source_parser import parse_tool_sources
 from ..memory.store import get_latest_plan
 from ..preferences.manager import get_preferences
 from ..preferences.prompt_builder import build_preference_prompt
 
 from .prompts import (
-    MAX_TOOL_ITERATIONS,
     RESEARCHER_PROMPT,
     PLANNER_PROMPT,
     PLAN_KEYWORDS,
+    MAX_SEARCH_ROUNDS,
 )
 from .context import (
     get_recent_messages,
     build_supervisor_context,
-    build_reviewer_context,
     build_planner_context,
     build_generate_context,
 )
+from .reviewer import assess_sources
 
 
 def get_llm(streaming: bool = False) -> ChatOpenAI:
@@ -88,7 +88,6 @@ async def load_context_node(state: AgentState) -> dict:
 
     return {
         "system_prompt": "\n\n".join(context_parts),
-        "retrieved_docs": [],
     }
 
 
@@ -133,6 +132,17 @@ async def supervisor_node(state: AgentState) -> dict:
     else:
         print(f"[DEBUG supervisor] agent_outputs keys={list(agent_outputs.keys())} (researcher not yet run)", file=sys.stderr, flush=True)
 
+    # 缺口补搜门控（确定性规则，绕过 LLM）：reviewer 产出缺口且补搜次数未达上限 → 定向补搜
+    gaps = state.get("retrieval_gaps", [])
+    search_round = state.get("search_round", 0)
+    if "researcher" in agent_outputs and gaps and search_round < MAX_SEARCH_ROUNDS:
+        print(f"[DEBUG supervisor] 触发第 {search_round + 1} 次补搜，缺口 {len(gaps)} 个", file=sys.stderr, flush=True)
+        return {
+            "next_agent": "researcher",
+            "search_round": search_round + 1,
+            "supervisor_log": log + [{"next": "researcher", "reason": f"存在 {len(gaps)} 个信息缺口，触发第 {search_round + 1} 次补搜"}],
+        }
+
     llm = get_llm()
     msgs = build_supervisor_context(state)
     response = await llm.ainvoke(msgs)
@@ -152,33 +162,6 @@ async def supervisor_node(state: AgentState) -> dict:
         "next_agent": next_agent,
         "supervisor_log": log + [{"next": next_agent, "reason": reason}],
     }
-
-
-def _parse_ratings(text: str) -> list[dict]:
-    """从 reviewer 输出中提取 JSON 评级数组（用括号计数匹配完整的 JSON 数组）。"""
-    idx = text.find('[')
-    if idx == -1:
-        return []
-    depth = 0
-    end = -1
-    for i in range(idx, len(text)):
-        if text[i] == '[':
-            depth += 1
-        elif text[i] == ']':
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
-    if end == -1:
-        return []
-    try:
-        ratings = json.loads(text[idx:end + 1])
-        for r in ratings:
-            r["credibility"] = r.get("credibility", "中")
-            r["source_number"] = r.get("source_number", 0)
-        return ratings
-    except json.JSONDecodeError:
-        return []
 
 
 async def _verify_source_urls(sources: list[dict], timeout: int = 5) -> list[dict]:
@@ -222,19 +205,35 @@ async def researcher_node(state: AgentState) -> dict:
     context = state.get("system_prompt", "")
     project_id = state["project_id"]
 
+    # 补搜轮：search_round > 0 即视为补搜，用缺口作为检索 query
+    is_refetch = state.get("search_round", 0) > 0
+    if is_refetch:
+        gaps = state.get("retrieval_gaps", [])
+        _query = " ".join(gaps) or _extract_user_query(state)
+    else:
+        _query = _extract_user_query(state)
+
     full_prompt = RESEARCHER_PROMPT
+    if is_refetch:
+        full_prompt += (
+            "\n\n## 补搜指令\n"
+            "这是补搜轮。上一轮检索遗漏了以下信息缺口，请针对这些缺口定向补搜：\n"
+            + "\n".join(f"- {g}" for g in gaps)
+        )
     if context:
         full_prompt += f"\n\n## 上下文信息\n{context}"
 
     tools = [web_search, aminer_search_papers, _make_rag_tool(project_id)]
 
-    all_sources: list[dict] = []
-    seen_ids: set[str] = set()
-    source_counter = 0
+    # 补搜轮：继承上一轮来源，继续编号，避免 source_number 冲突
+    existing_sources = state.get("reference_sources", [])
+    all_sources: list[dict] = list(existing_sources)
+    seen_ids: set[str] = {s["id"] for s in existing_sources}
+    source_counter = max((s.get("source_number", 0) for s in existing_sources), default=0)
 
     def _collect_sources(tool_name: str, result: str) -> None:
         nonlocal source_counter
-        parsed = _parse_tool_source(tool_name, result)
+        parsed = parse_tool_sources(tool_name, result)
         for s in parsed:
             if s["id"] not in seen_ids:
                 seen_ids.add(s["id"])
@@ -249,7 +248,14 @@ async def researcher_node(state: AgentState) -> dict:
             result = f"工具执行失败: {e}"
         return tc, result, tool_obj.name
 
-    _query = _extract_user_query(state)
+    prev_output = state.get("agent_outputs", {}).get("researcher", "")
+
+    def _merge_output(new_text: str) -> str:
+        new_text = (new_text or "").strip()
+        if not new_text:
+            return _truncate_output(prev_output)
+        merged = (prev_output + "\n\n" + new_text) if prev_output else new_text
+        return _truncate_output(merged)
 
     # 检查是否有上传文件需要检索
     from ..tools.file_rag import get_project_files
@@ -260,7 +266,7 @@ async def researcher_node(state: AgentState) -> dict:
     user_specified = [t for t in state.get("required_tools", [])
                       if t in ("web_search", "aminer_search_papers", "search_uploaded_docs")]
     if user_specified:
-        query = _extract_user_query(state)[:200]
+        query = _query[:200]
         tool_by_name = {t.name: t for t in tools}
         coros = []
         for name in user_specified:
@@ -269,7 +275,7 @@ async def researcher_node(state: AgentState) -> dict:
                 continue
             args = {"query": query}
             if name == "aminer_search_papers":
-                args["count"] = 5
+                args["count"] = 10
             coros.append(_invoke_one({"id": f"user_{name}", "name": name, "args": args}, tool_obj))
 
         output_parts = []
@@ -282,14 +288,14 @@ async def researcher_node(state: AgentState) -> dict:
         all_sources = await _verify_source_urls(all_sources)
 
         return {
-            "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _truncate_output("\n\n".join(output_parts))},
+            "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _merge_output("\n\n".join(output_parts))},
             "reference_sources": all_sources,
         }
 
     # 用户提及文件且有上传文件 → 优先文档检索 + 网络搜索补充
     if _mentions_files and _has_uploads:
         print("[DEBUG researcher] direct search (search_uploaded_docs + web_search)", file=sys.stderr, flush=True)
-        query = _extract_user_query(state)[:200]
+        query = _query[:200]
         tool_by_name = {t.name: t for t in tools}
         coros = []
         for name in ("search_uploaded_docs", "web_search"):
@@ -307,7 +313,7 @@ async def researcher_node(state: AgentState) -> dict:
         all_sources = await _verify_source_urls(all_sources)
 
         return {
-            "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _truncate_output("\n\n".join(output_parts))},
+            "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _merge_output("\n\n".join(output_parts))},
             "reference_sources": all_sources,
         }
 
@@ -321,7 +327,7 @@ async def researcher_node(state: AgentState) -> dict:
         print("[DEBUG researcher] LLM returned NO tool calls, returning text only (no sources)", file=sys.stderr, flush=True)
         all_sources = await _verify_source_urls(all_sources)
         return {
-            "agent_outputs": {**state.get("agent_outputs", {}), "researcher": response.content},
+            "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _merge_output(response.content)},
             "reference_sources": all_sources,
         }
 
@@ -344,31 +350,39 @@ async def researcher_node(state: AgentState) -> dict:
     print(f"[DEBUG researcher] tool_calls={len(response.tool_calls)}, coros={len(coros)}, sources={len(all_sources)}, output_len={len(_truncate_output(chr(10).join(output_parts) if output_parts else ''))}", file=sys.stderr, flush=True)
     all_sources = await _verify_source_urls(all_sources)
     return {
-        "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _truncate_output("\n\n".join(output_parts))},
+        "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _merge_output("\n\n".join(output_parts))},
         "reference_sources": all_sources,
     }
 
 
 
 async def reviewer_node(state: AgentState) -> dict:
-    """学术评审 agent：无工具，纯推理批判性评估。输出 JSON 评级 + 简短文字。"""
+    """学术评审 agent：规则信号 + LLM 两阶段评估，输出评分卡 + 小结 + 缺口。"""
     import time
     t0 = time.time()
-    llm = get_llm()
-    msgs = build_reviewer_context(state)
+    user_query = _extract_user_query(state)
+    result = await assess_sources(state, user_query=user_query)
     t1 = time.time()
-    total_chars = sum(len(str(m.content)) for m in msgs)
-    print(f"[DEBUG reviewer] context built in {t1 - t0:.1f}s, {len(msgs)} msgs, {total_chars} chars total", file=sys.stderr, flush=True)
-    response = await llm.ainvoke(msgs)
-    t2 = time.time()
-    print(f"[DEBUG reviewer] LLM call took {t2 - t1:.1f}s, output {len(response.content)} chars", file=sys.stderr, flush=True)
+    print(f"[DEBUG reviewer] assess_sources took {t1 - t0:.1f}s, {len(result.assessments)} assessments, {len(result.gaps)} gaps", file=sys.stderr, flush=True)
 
-    ratings = _parse_ratings(response.content)
-    print(f"[DEBUG reviewer] parsed {len(ratings)} ratings", file=sys.stderr, flush=True)
+    assessments = [a.model_dump() for a in result.assessments]
+
+    # 兼容旧 source_ratings 结构（source_number/credibility/reason），供 server.py 与前端沿用
+    source_ratings = [
+        {
+            "source_number": a.source_number,
+            "credibility": a.credibility,
+            "reason": a.evidence or a.credibility,
+        }
+        for a in result.assessments
+    ]
+    reviewer_text = _format_reviewer_text(result)
 
     return {
-        "agent_outputs": {**state.get("agent_outputs", {}), "reviewer": response.content},
-        "source_ratings": ratings,
+        "agent_outputs": {**state.get("agent_outputs", {}), "reviewer": reviewer_text},
+        "source_ratings": source_ratings,
+        "source_assessments": assessments,
+        "retrieval_gaps": result.gaps,
     }
 
 
@@ -444,10 +458,25 @@ RAG_CHUNK_MAX_CHARS = 300
 
 
 def _truncate_output(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
-    """截断过长输出以降低下游 LLM 的首 token 延迟。"""
+    """截断过长输出以降低下游 LLM 的首 token 延迟。
+
+    当前按需保留完整输出：不再截断，直接返回原文。
+    """
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + "\n\n[结果过长已截断]"
+    return text
+
+
+def _format_reviewer_text(result) -> str:
+    """把 reviewer 结构化结果组装成人类可读文字，供 generate_response 消费。"""
+    lines = []
+    if result.summary:
+        lines.append(f"整体质量小结：{result.summary}")
+    for a in result.assessments:
+        lines.append(f"来源[{a.source_number}] 可信度「{a.credibility}」(综合 {a.score})：{a.evidence}")
+    if result.gaps:
+        lines.append("信息缺口：" + "；".join(result.gaps))
+    return "\n".join(lines) if lines else "无评估结果"
 
 
 def _parse_decision(text: str) -> dict:
@@ -507,89 +536,21 @@ def _make_rag_tool(project_id: str):
             # 与 CHUNK_SIZE(300) 对齐：块在 300 以内时完整注入，超出才截断
             if len(content) > RAG_CHUNK_MAX_CHARS:
                 content = content[:RAG_CHUNK_MAX_CHARS] + "…（片段已截断）"
-            header = f"[{i}] 来源: {src}\n分块: {ci}"
+            pos_parts = []
             if section:
-                header += f" | 章节: {section}"
+                pos_parts.append(f"章节: {section}")
             if page and para:
-                header += f" | 第{page}页 第{para}段"
-            lines.append(f"{header}\n{content}")
+                pos_parts.append(f"第{page}页 第{para}段")
+            line = f"{i}. [doc] {src}\n"
+            line += f"   来源: {src}\n"
+            if pos_parts:
+                line += f"   附加: {' | '.join(pos_parts)}\n"
+            line += f"   内容: {content}\n"
+            lines.append(line)
 
         return "\n\n".join(lines)
 
     return search_uploaded_docs
-
-
-def _format_rag_context(docs: list[dict]) -> str:
-    """将检索到的文档片段格式化为上下文字符串。"""
-    lines = []
-    for i, doc in enumerate(docs, 1):
-        src = doc.get("filename", "未知文件")
-        content = doc.get("content", "")
-        lines.append(f"[{i}] 来源: {src}\n{content}")
-    return "\n\n".join(lines)
-
-
-def _parse_tool_source(tool_name: str, output_text: str) -> list[dict]:
-    """从原始工具输出中解析结构化来源信息。返回 [{id, title, url, summary, source_type}, ...]"""
-    sources: list[dict] = []
-    if tool_name == "web_search":
-        pattern = re.compile(
-            r'(\d+)\.\s*(.+?)\n\s+来源:\s*(.+?)\s*\|\s*URL:\s*(.+?)\n\s+(.+?)(?=\n\n\d+\.|\n\d+\.|\Z)',
-            re.DOTALL,
-        )
-        for m in pattern.finditer(output_text):
-            url = m.group(4).strip()
-            title = m.group(2).strip()
-            sid = hashlib.md5(f"{url}|{title}".encode()).hexdigest()[:12]
-            sources.append({
-                "id": sid, "title": title, "url": url,
-                "summary": m.group(5).strip()[:300], "source_type": "web",
-            })
-    elif tool_name == "aminer_search_papers":
-        pattern = re.compile(
-            r'(\d+)\.\s+\*\*(.+?)\*\*\n((?:(?!\n\d+\.\s).)*)',
-            re.DOTALL,
-        )
-        for m in pattern.finditer(output_text):
-            title = m.group(2).strip()
-            meta = m.group(3)
-            doi_match = re.search(r'DOI:\s*(\S+)', meta)
-            url = f"https://doi.org/{doi_match.group(1).strip()}" if doi_match else ""
-            sid = hashlib.md5(f"{url}|{title}".encode()).hexdigest()[:12]
-            sources.append({
-                "id": sid, "title": title, "url": url,
-                "summary": meta.strip()[:300], "source_type": "paper",
-            })
-    elif tool_name == "search_uploaded_docs":
-        pattern = re.compile(
-            r'\[(\d+)\]\s*来源:\s*(\S+)\n分块:\s*(\d+)(?:\s*\|\s*章节:\s*(.+?))?(?:\s*\|\s*第(\d+)页\s+第(\d+)段)?\n(.+?)(?=\[\d+\]|\Z)',
-            re.DOTALL,
-        )
-        for m in pattern.finditer(output_text):
-            filename = m.group(2).strip()
-            chunk_index = int(m.group(3))
-            section = (m.group(4) or "").strip()
-            page = int(m.group(5)) if m.group(5) else 1
-            paragraph = int(m.group(6)) if m.group(6) else 0
-            content = m.group(7).strip()
-            sid = hashlib.md5(f"{filename}_{chunk_index}".encode()).hexdigest()[:12]
-            pos_parts = []
-            if section:
-                pos_parts.append(section)
-            if paragraph:
-                pos_parts.append(f"第{paragraph}段")
-            sources.append({
-                "id": sid,
-                "title": filename,
-                "url": "",
-                "summary": content[:50].replace("\n", " "),
-                "source_type": "document",
-                "page": page,
-                "position": " | ".join(pos_parts),
-                "chunk_index": chunk_index,
-                "section": section,
-            })
-    return sources
 
 
 def _parse_plan_options(text: str) -> list[dict]:
@@ -615,60 +576,4 @@ def _parse_plan_options(text: str) -> list[dict]:
     ]
 
 
-async def _run_tool_loop(llm, system_prompt: str, user_msgs: list, tools: list) -> tuple[str, list[dict]]:
-    """在 agent 内部执行工具调用循环，返回 (最终文本输出, 从工具输出中解析的来源列表)。"""
-    if not tools:
-        msgs = [SystemMessage(content=system_prompt)] + user_msgs
-        response = await llm.ainvoke(msgs)
-        return response.content, []
 
-    llm_with_tools = llm.bind_tools(tools)
-    msgs = [SystemMessage(content=system_prompt)] + user_msgs
-
-    response = await llm_with_tools.ainvoke(msgs)
-    iterations = 0
-
-    all_sources: list[dict] = []
-    seen_ids: set[str] = set()
-    source_counter = 0
-
-    while response.tool_calls and iterations < MAX_TOOL_ITERATIONS:
-        # 并行调用工具（使用 ainvoke 保持 LangGraph 追踪上下文）
-        async def _invoke_one(tc: dict, tool_obj):
-            try:
-                result = str(await tool_obj.ainvoke(tc.get("args", {})))
-            except Exception as e:
-                result = f"工具执行失败: {e}"
-            return tc, result, tool_obj.name
-
-        coros = []
-        for tc in response.tool_calls[:3]:
-            tool_name = tc.get("name", "")
-            for tool in tools:
-                if tool.name == tool_name:
-                    coros.append(_invoke_one(tc, tool))
-                    break
-
-        if not coros:
-            break
-
-        results = await asyncio.gather(*coros)
-
-        tool_msgs = []
-        for tc, result, tool_name in results:
-            tool_msgs.append(ToolMessage(content=result, tool_call_id=tc.get("id", "")))
-
-            if tool_name in ("web_search", "aminer_search_papers", "search_uploaded_docs"):
-                parsed = _parse_tool_source(tool_name, result)
-                for s in parsed:
-                    if s["id"] not in seen_ids:
-                        seen_ids.add(s["id"])
-                        source_counter += 1
-                        s["source_number"] = source_counter
-                        all_sources.append(s)
-
-        msgs = msgs + [response] + tool_msgs
-        response = await llm_with_tools.ainvoke(msgs)
-        iterations += 1
-
-    return response.content, all_sources

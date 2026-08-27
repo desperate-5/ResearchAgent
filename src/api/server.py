@@ -1,9 +1,7 @@
 import asyncio
 import json
 import os
-import re
 import sys
-import hashlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
@@ -22,6 +20,7 @@ from ..memory.compressor import generate_summary
 from ..projects.manager import create_project, list_projects, get_project, delete_project, rename_project, update_timestamp
 from ..preferences.manager import get_preferences, save_preferences, apply_feedback, get_raw_preferences, save_raw_preferences
 from ..tools import file_rag
+from ..tools.source_parser import parse_tool_sources
 from ..export.report import generate_report
 from .models import (
     ChatRequest, CreateProjectRequest, RenameProjectRequest,
@@ -281,100 +280,6 @@ async def api_export_report(project_id: str):
 # 对话 API
 # ============================================================
 
-def _parse_web_search_sources(text: str) -> list[dict]:
-    """解析 web_search 工具输出中的结构化来源信息。"""
-    sources = []
-    # 匹配格式: N. title\n   来源: site | URL: url\n   summary
-    pattern = re.compile(
-        r'(\d+)\.\s*(.+?)\n\s+来源:\s*(.+?)\s*\|\s*URL:\s*(.+?)\n\s+(.+?)(?=\n\n\d+\.|\n\d+\.|\Z)',
-        re.DOTALL,
-    )
-    for m in pattern.finditer(text):
-        url = m.group(4).strip()
-        title = m.group(2).strip()
-        sid = hashlib.md5(f"{url}|{title}".encode()).hexdigest()[:12]
-        sources.append({
-            "id": sid,
-            "title": title,
-            "url": url,
-            "summary": m.group(5).strip()[:300],
-            "source_type": "web",
-        })
-    return sources
-
-
-def _parse_paper_sources(text: str) -> list[dict]:
-    """解析 aminer_search_papers 工具输出中的结构化来源信息。"""
-    sources = []
-    # 匹配格式: N. **title**\n   第一作者: ...\n   来源: ...\n   DOI: ...
-    pattern = re.compile(
-        r'(\d+)\.\s+\*\*(.+?)\*\*\n((?:(?!\n\d+\.\s).)*)',
-        re.DOTALL,
-    )
-    for m in pattern.finditer(text):
-        title = m.group(2).strip()
-        meta = m.group(3)
-        doi = ""
-        doi_match = re.search(r'DOI:\s*(\S+)', meta)
-        if doi_match:
-            doi = doi_match.group(1).strip()
-        url = f"https://doi.org/{doi}" if doi else ""
-        sid = hashlib.md5(f"{url}|{title}".encode()).hexdigest()[:12]
-        sources.append({
-            "id": sid,
-            "title": title,
-            "url": url,
-            "summary": meta.strip()[:300],
-            "source_type": "paper",
-        })
-    return sources
-
-
-def _parse_rag_sources(text: str) -> list[dict]:
-    """解析 search_uploaded_docs 工具输出中的文档来源信息。"""
-    sources = []
-    pattern = re.compile(
-        r'\[(\d+)\]\s*来源:\s*(\S+)\n分块:\s*(\d+)(?:\s*\|\s*章节:\s*(.+?))?(?:\s*\|\s*第(\d+)页\s+第(\d+)段)?\n(.+?)(?=\[\d+\]|\Z)',
-        re.DOTALL,
-    )
-    for m in pattern.finditer(text):
-        filename = m.group(2).strip()
-        chunk_index = int(m.group(3))
-        section = (m.group(4) or "").strip()
-        page = int(m.group(5)) if m.group(5) else 1
-        paragraph = int(m.group(6)) if m.group(6) else 0
-        content = m.group(7).strip()
-        sid = hashlib.md5(f"{filename}_{chunk_index}".encode()).hexdigest()[:12]
-        pos_parts = []
-        if section:
-            pos_parts.append(section)
-        if paragraph:
-            pos_parts.append(f"第{paragraph}段")
-        sources.append({
-            "id": sid,
-            "title": filename,
-            "url": "",
-            "summary": content[:50].replace("\n", " "),
-            "source_type": "document",
-            "page": page,
-            "position": " | ".join(pos_parts),
-            "chunk_index": chunk_index,
-            "section": section,
-        })
-    return sources
-
-
-def _parse_tool_sources(tool_name: str, output_text: str) -> list[dict]:
-    """根据工具名称解析工具输出文本中的结构化来源信息。"""
-    if tool_name == "web_search":
-        return _parse_web_search_sources(output_text)
-    elif tool_name == "aminer_search_papers":
-        return _parse_paper_sources(output_text)
-    elif tool_name == "search_uploaded_docs":
-        return _parse_rag_sources(output_text)
-    return []
-
-
 def _merge_ratings_into_sources(all_sources, ratings):
     """将可信度评价合并到 sources 中，确保持久化后刷新页面不丢失。"""
     if not ratings:
@@ -427,17 +332,17 @@ async def chat(request: ChatRequest, req: Request):
         "project_id": request.project_id,
         "summary": existing_summary,
         "system_prompt": "",
-        "search_results": [],
-        "retrieved_docs": [],
         "agent_outputs": {},
         "next_agent": "",
         "supervisor_log": [],
         "required_tools": request.tools,
         "reference_sources": [],
         "source_ratings": [],
+        "source_assessments": [],
+        "retrieval_gaps": [],
+        "search_round": 0,
         "plan_options": [],
         "chosen_plan_id": "",
-        "chosen_plan_detail": {},
         "custom_plan_text": "",
     }
 
@@ -516,7 +421,7 @@ async def chat(request: ChatRequest, req: Request):
                     output = event["data"].get("output")
                     if output is not None and tool_name in ("web_search", "aminer_search_papers", "search_uploaded_docs"):
                         output_text = str(output.content) if hasattr(output, "content") else str(output)
-                        sources = _parse_tool_sources(tool_name, output_text)
+                        sources = parse_tool_sources(tool_name, output_text)
                         if sources:
                             # 分配编号、去重
                             numbered = []
@@ -713,7 +618,7 @@ async def chat_resume(request: PlanResumeRequest, req: Request):
                     output = event["data"].get("output")
                     if output is not None and tool_name in ("web_search", "aminer_search_papers", "search_uploaded_docs"):
                         output_text = str(output.content) if hasattr(output, "content") else str(output)
-                        sources = _parse_tool_sources(tool_name, output_text)
+                        sources = parse_tool_sources(tool_name, output_text)
                         if sources:
                             numbered = []
                             for s in sources:

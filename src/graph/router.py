@@ -21,8 +21,3 @@ def route_from_supervisor(state: AgentState) -> str:
     if next_agent in ("researcher", "planner"):
         return next_agent
     return "generate_response"
-
-
-def route_from_researcher(state: AgentState) -> str:
-    """researcher 完成后进入 reviewer 审查。"""
-    return "reviewer"
