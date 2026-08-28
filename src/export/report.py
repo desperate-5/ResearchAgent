@@ -3,8 +3,8 @@ from datetime import datetime, timezone
 
 from langchain_openai import ChatOpenAI
 
-from ..memory.store import get_history, get_summary, get_project_sources, get_latest_plan
-from ..projects.manager import get_project
+from ..storage.records import get_history, get_summary, get_project_sources, get_latest_plan
+from ..storage.projects import get_project
 
 
 REPORT_SYSTEM_PROMPT = """你是一个学术写作专家。你的任务是基于已有的研究资料，撰写一篇高质量、结构化的中文学术文章。

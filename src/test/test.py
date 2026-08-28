@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -32,17 +32,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from src.graph.builder import build_graph
 from src.graph.nodes import researcher_node
 from src.tools.aminer_search import AMINER_API_URL, _generate_token
-from src.memory.store import init_db, get_summary
-from src.projects.manager import create_project, get_project
-from src.tools.file_rag import (
-    APIEmbeddingFunction,
-    TOP_K,
-    _get_collection,
-    _get_embedding_fn,
-    get_project_files,
-    index_document,
-    search_chunks,
-)
+from src.storage.db import init_db
+from src.storage.records import get_summary
+from src.storage.projects import create_project, get_project
+from src.rag.embedding import APIEmbeddingFunction, _get_embedding_fn
+from src.rag.config import TOP_K
+from src.rag.store import _get_collection, get_project_files, index_document, search_chunks
 
 NODES = {
     "load_context": "加载上下文",
@@ -413,9 +408,9 @@ async def _run_tools_compare(question: str, project_id: str) -> dict:
     """分别调用三种检索方式，独立收集各自结果。"""
     from src.tools.web_search import web_search
     from src.tools.aminer_search import aminer_search_papers
-    from src.graph.nodes import _make_rag_tool
+    from src.tools.rag_tool import make_rag_tool
 
-    doc_tool = _make_rag_tool(project_id)
+    doc_tool = make_rag_tool(project_id)
     tasks = {
         "web_search": _invoke_tool_safely(web_search, {"query": question}),
         "aminer_search_papers": _invoke_tool_safely(aminer_search_papers, {"query": question, "count": 10}),

@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, timezone
-from ..memory.store import _get_conn
+
+from .db import _get_conn
 
 
 def create_project(name: str) -> dict:

@@ -13,14 +13,15 @@ from langgraph.errors import GraphInterrupt
 
 from ..graph.builder import build_graph
 from ..graph.state import AgentState
-from ..graph.context import count_turns, last_n_turns
 from ..graph.prompts import COMPRESSION_TURN_THRESHOLD
-from ..memory.store import init_db, save_message, get_history, get_summary, save_summary, save_project_sources, get_project_sources, save_project_plan, get_latest_plan
-from ..memory.compressor import generate_summary
-from ..projects.manager import create_project, list_projects, get_project, delete_project, rename_project, update_timestamp
+from ..context.windowing import count_turns, last_n_turns
+from ..context.compression import generate_summary
+from ..storage.db import init_db
+from ..storage.records import save_message, get_history, get_summary, save_summary, save_project_sources, get_project_sources, save_project_plan, get_latest_plan
+from ..storage.projects import create_project, list_projects, get_project, delete_project, rename_project, update_timestamp
 from ..preferences.manager import get_preferences, save_preferences, apply_feedback, get_raw_preferences, save_raw_preferences
-from ..tools import file_rag
-from ..tools.source_parser import parse_tool_sources
+from ..rag.store import get_project_files, index_document, delete_project_index
+from ..sources.parser import parse_tool_sources
 from ..export.report import generate_report
 from .models import (
     ChatRequest, CreateProjectRequest, RenameProjectRequest,
@@ -85,7 +86,7 @@ def api_delete_project(project_id: str):
     if not get_project(project_id):
         raise HTTPException(status_code=404, detail="项目不存在")
     delete_project(project_id)
-    file_rag.delete_project_index(project_id)
+    delete_project_index(project_id)
     return {"status": "deleted"}
 
 
@@ -215,7 +216,7 @@ async def api_upload_file(project_id: str, file: UploadFile = File(...)):
 
     # 索引文档
     try:
-        chunk_count = file_rag.index_document(project_id, file_path, file.filename)
+        chunk_count = index_document(project_id, file_path, file.filename)
     except Exception as e:
         # 索引失败时删除已保存的文件
         os.remove(file_path)
@@ -233,7 +234,7 @@ async def api_upload_file(project_id: str, file: UploadFile = File(...)):
 def api_list_files(project_id: str):
     if not get_project(project_id):
         raise HTTPException(status_code=404, detail="项目不存在")
-    return file_rag.get_project_files(project_id)
+    return get_project_files(project_id)
 
 
 @app.delete("/projects/{project_id}/files/{filename}")
@@ -248,7 +249,7 @@ def api_delete_file(project_id: str, filename: str):
     os.remove(file_path)
 
     # 重建索引（移除该文件的所有 chunks）
-    file_rag.delete_project_index(project_id)
+    delete_project_index(project_id)
     # 重新索引剩余文件
     proj_dir = os.path.join(UPLOAD_BASE, project_id)
     if os.path.exists(proj_dir):
@@ -256,7 +257,7 @@ def api_delete_file(project_id: str, filename: str):
             fpath = os.path.join(proj_dir, f)
             if os.path.isfile(fpath):
                 try:
-                    file_rag.index_document(project_id, fpath, f)
+                    index_document(project_id, fpath, f)
                 except Exception:
                     pass
 

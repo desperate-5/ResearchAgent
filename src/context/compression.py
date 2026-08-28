@@ -1,6 +1,9 @@
+"""对话压缩：把长对话历史压缩为结构化摘要，供后续请求复用。"""
+
 import os
-from langchain_openai import ChatOpenAI
+
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_openai import ChatOpenAI
 
 
 COMPRESSION_PROMPT = """请将以下对话历史压缩为结构化摘要。保留所有关键信息，丢弃闲聊和冗余内容。

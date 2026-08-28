@@ -1,38 +1,19 @@
-"""上下文构建函数。负责组装各 agent 的消息列表（system prompt + 最近对话 + agent 输出摘要等）。"""
+"""各 agent 调用上下文组装：把系统提示、历史对话、agent 输出、调度记录拼成消息列表。"""
 
-from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
-from .state import AgentState
-from .prompts import (
+from langchain_core.messages import SystemMessage, AIMessage
+
+from ..graph.prompts import (
     SUPERVISOR_PROMPT,
     SUPERVISOR_PROMPT_MINIMAL,
     PLANNER_PROMPT,
     GENERATE_PROMPT,
-    MAX_CONTEXT_TURNS,
     TOOL_AGENT_MAP,
 )
+from ..sources.rerank import rerank_sources
+from .windowing import get_recent_messages
 
 
-def count_turns(messages: list) -> int:
-    """统计对话轮数：一轮 = 一条用户消息。"""
-    return sum(1 for m in messages if isinstance(m, HumanMessage))
-
-
-def last_n_turns(messages: list, n: int) -> list:
-    """取最近 n 轮的完整消息（按用户消息边界切分，保证轮次完整）。"""
-    user_indices = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage)]
-    if len(user_indices) <= n:
-        return messages
-    return messages[user_indices[-n]:]
-
-
-def get_recent_messages(state: AgentState) -> list:
-    """获取最近的用户对话消息（不含 system message），最多 MAX_CONTEXT_TURNS 轮。"""
-    all_messages = list(state["messages"])
-    conv_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
-    return last_n_turns(conv_msgs, MAX_CONTEXT_TURNS)
-
-
-def build_supervisor_context(state: AgentState) -> list:
+def build_supervisor_context(state: dict) -> list:
     """构建 supervisor 的消息列表：系统提示 + 上下文 + 最近对话 + agent 输出摘要 + 调度记录。"""
     recent = get_recent_messages(state)
 
@@ -87,7 +68,7 @@ def build_supervisor_context(state: AgentState) -> list:
     return msgs
 
 
-def build_planner_context(state: AgentState) -> list:
+def build_planner_context(state: dict) -> list:
     """构建 planner 的消息列表：系统提示 + researcher 输出。"""
     recent = get_recent_messages(state)
 
@@ -107,7 +88,7 @@ def build_planner_context(state: AgentState) -> list:
     return msgs
 
 
-def build_generate_context(state: AgentState) -> list:
+def build_generate_context(state: dict) -> list:
     """构建 generate_response 的消息列表：综合所有 agent 输出 + 原始用户问题 + 参考文献编号对照。"""
     recent = get_recent_messages(state)
 
@@ -122,13 +103,19 @@ def build_generate_context(state: AgentState) -> list:
 
     if agent_outputs.get("researcher"):
         researcher_output = agent_outputs["researcher"]
-        ref_sources = state.get("reference_sources", [])
+        raw_sources = state.get("reference_sources", [])
+        assessments = state.get("source_assessments", [])
+        ref_sources = rerank_sources(raw_sources, assessments)
         parts.append(f"## 文献检索结果\n{researcher_output}")
         if ref_sources:
+            by_num = {a.get("source_number"): a for a in assessments}
             ref_lines = []
             for s in ref_sources:
                 sn = s["source_number"]
                 title = s['title']
+                a = by_num.get(sn)
+                if a and float(a.get("score", 5.0)) < 2.5:
+                    title += "（待验证）"
                 extra = ""
                 if s.get("section"):
                     extra = f"「{s['section']}」"

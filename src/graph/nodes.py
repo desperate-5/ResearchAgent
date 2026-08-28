@@ -7,29 +7,29 @@ import httpx
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
-from langchain_core.tools import tool
 from langgraph.types import interrupt
 from .state import AgentState
 
 from ..tools.web_search import web_search
 from ..tools.aminer_search import aminer_search_papers
-from ..tools.file_rag import search_chunks
-from ..tools.source_parser import parse_tool_sources
-from ..memory.store import get_latest_plan
+from ..tools.rag_tool import make_rag_tool
+from ..sources.parser import parse_tool_sources
+from ..storage.records import get_latest_plan
 from ..preferences.manager import get_preferences
 from ..preferences.prompt_builder import build_preference_prompt
+from ..context.windowing import get_recent_messages
+from ..context.builders import (
+    build_supervisor_context,
+    build_planner_context,
+    build_generate_context,
+)
+from ..context.tool_compression import truncate_output
 
 from .prompts import (
     RESEARCHER_PROMPT,
     PLANNER_PROMPT,
     PLAN_KEYWORDS,
     MAX_SEARCH_ROUNDS,
-)
-from .context import (
-    get_recent_messages,
-    build_supervisor_context,
-    build_planner_context,
-    build_generate_context,
 )
 from .reviewer import assess_sources
 
@@ -74,7 +74,7 @@ async def load_context_node(state: AgentState) -> dict:
         context_parts.append(prefs_text)
 
     # 列出项目已上传的文件，帮助 researcher 判断是否需要调用 search_uploaded_docs
-    from ..tools.file_rag import get_project_files
+    from ..rag.store import get_project_files
     project_files = get_project_files(project_id)
     if project_files:
         file_names = [f["filename"] for f in project_files]
@@ -223,7 +223,7 @@ async def researcher_node(state: AgentState) -> dict:
     if context:
         full_prompt += f"\n\n## 上下文信息\n{context}"
 
-    tools = [web_search, aminer_search_papers, _make_rag_tool(project_id)]
+    tools = [web_search, aminer_search_papers, make_rag_tool(project_id)]
 
     # 补搜轮：继承上一轮来源，继续编号，避免 source_number 冲突
     existing_sources = state.get("reference_sources", [])
@@ -253,12 +253,12 @@ async def researcher_node(state: AgentState) -> dict:
     def _merge_output(new_text: str) -> str:
         new_text = (new_text or "").strip()
         if not new_text:
-            return _truncate_output(prev_output)
+            return truncate_output(prev_output)
         merged = (prev_output + "\n\n" + new_text) if prev_output else new_text
-        return _truncate_output(merged)
+        return truncate_output(merged)
 
     # 检查是否有上传文件需要检索
-    from ..tools.file_rag import get_project_files
+    from ..rag.store import get_project_files
     _has_uploads = len(get_project_files(project_id)) > 0
     _mentions_files = any(kw in _query for kw in ("上传", "文档", "文件", "这篇", "这份", "PDF"))
 
@@ -347,7 +347,7 @@ async def researcher_node(state: AgentState) -> dict:
             output_parts.append(f"## {tool_name} 结果\n{result}")
             _collect_sources(tool_name, result)
 
-    print(f"[DEBUG researcher] tool_calls={len(response.tool_calls)}, coros={len(coros)}, sources={len(all_sources)}, output_len={len(_truncate_output(chr(10).join(output_parts) if output_parts else ''))}", file=sys.stderr, flush=True)
+    print(f"[DEBUG researcher] tool_calls={len(response.tool_calls)}, coros={len(coros)}, sources={len(all_sources)}, output_len={len(truncate_output(chr(10).join(output_parts) if output_parts else ''))}", file=sys.stderr, flush=True)
     all_sources = await _verify_source_urls(all_sources)
     return {
         "agent_outputs": {**state.get("agent_outputs", {}), "researcher": _merge_output("\n\n".join(output_parts))},
@@ -451,22 +451,6 @@ async def generate_response_node(state: AgentState) -> dict:
 # 内部函数
 # ============================================================
 
-MAX_OUTPUT_CHARS = 3500
-
-# RAG 片段注入生成 prompt 的最大字符数：与 file_rag 的 CHUNK_SIZE(300) 对齐，保证每块完整注入且 prompt 体量可控
-RAG_CHUNK_MAX_CHARS = 300
-
-
-def _truncate_output(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
-    """截断过长输出以降低下游 LLM 的首 token 延迟。
-
-    当前按需保留完整输出：不再截断，直接返回原文。
-    """
-    if len(text) <= max_chars:
-        return text
-    return text
-
-
 def _format_reviewer_text(result) -> str:
     """把 reviewer 结构化结果组装成人类可读文字，供 generate_response 消费。"""
     lines = []
@@ -513,44 +497,6 @@ def _extract_user_query(state: AgentState) -> str:
                     if isinstance(part, dict) and part.get("type") == "text":
                         return part.get("text", "")
     return ""
-
-
-def _make_rag_tool(project_id: str):
-    """创建一个绑定到特定项目的 RAG 检索工具。每次请求动态生成，确保 project_id 正确。"""
-
-    @tool
-    def search_uploaded_docs(query: str) -> str:
-        """搜索用户已上传的 PDF/Word 文档内容。当用户提到「我上传的文件」「这篇论文」「文档里」「文件里」时使用此工具。"""
-        docs = search_chunks(project_id, query)
-        if not docs:
-            return "未在已上传的文档中找到相关内容。"
-
-        lines = []
-        for i, doc in enumerate(docs, 1):
-            src = doc.get("filename", "未知文件")
-            content = doc.get("content", "")
-            page = doc.get("page", 1)
-            para = doc.get("paragraph", 0)
-            ci = doc.get("chunk_index", i - 1)
-            section = doc.get("section", "")
-            # 与 CHUNK_SIZE(300) 对齐：块在 300 以内时完整注入，超出才截断
-            if len(content) > RAG_CHUNK_MAX_CHARS:
-                content = content[:RAG_CHUNK_MAX_CHARS] + "…（片段已截断）"
-            pos_parts = []
-            if section:
-                pos_parts.append(f"章节: {section}")
-            if page and para:
-                pos_parts.append(f"第{page}页 第{para}段")
-            line = f"{i}. [doc] {src}\n"
-            line += f"   来源: {src}\n"
-            if pos_parts:
-                line += f"   附加: {' | '.join(pos_parts)}\n"
-            line += f"   内容: {content}\n"
-            lines.append(line)
-
-        return "\n\n".join(lines)
-
-    return search_uploaded_docs
 
 
 def _parse_plan_options(text: str) -> list[dict]:
