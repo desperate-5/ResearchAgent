@@ -50,11 +50,15 @@ RELEVANCE_PROMPT = """你是信息源相关性评估专家。判断下面这条�
 摘要：{summary}"""
 
 
-GLOBAL_PROMPT = """你是信息源综合评估专家。基于给定的多条来源，完成三件事：
+GLOBAL_PROMPT = """你是信息源综合评估专家。基于给定的多条来源，完成四件事：
 
 1. **一致性**：判断每条来源的结论与其他来源是否一致，逐条给出 0-5 分（5=与多数来源一致，0=与其他来源明显冲突）。
 2. **缺口**：列出用户问题尚未被这些来源覆盖的关键子主题（每条一句话）。没有明显缺口则输出空列表。
-3. **小结**：用 1-2 句话概括这批来源的整体质量。
+3. **needs_refetch**：判断这批来源是否**明显不足**、需要立即补搜。判定标准（重要）：
+   - 只有当前结果**无法回答用户问题的核心部分**（如关键子主题完全缺失、来源数量过少、相关性普遍偏低）时才为 true；
+   - 检索结果大体可用、只是"还能补充更多细节 / 更多文献 / 更深层次"时，**必须为 false**（即使列出了少量可选补充主题）；
+   - 不确定时取 false（宁可少补搜一次，节省时间）。
+4. **小结**：用 1-2 句话概括这批来源的整体质量。
 
 用户问题：
 {question}
@@ -91,7 +95,7 @@ def _build_example(pydantic_cls) -> dict:
         elif ann is str:
             ex[name] = "一句话理由"
         elif ann is bool:
-            ex[name] = True
+            ex[name] = False  # 布尔字段示例默认 false，避免引导模型输出 true（needs_refetch 同理）
         else:
             ex[name] = None
     return ex
@@ -105,6 +109,7 @@ def _coerce_fields(pydantic_cls, data: dict) -> dict:
         "source_number": ("source_number", "id", "source"),
         "summary": ("summary", "sum", "conclusion"),
         "gaps": ("gaps", "gap", "missing", "missing_topics"),
+        "needs_refetch": ("needs_refetch", "need_refetch", "refetch", "need_retry", "should_refetch"),
         "reason": ("reason", "explanation", "why"),
     }
     fields = pydantic_cls.model_fields

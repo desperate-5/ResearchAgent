@@ -795,6 +795,16 @@ input:focus, textarea:focus { border-color: var(--primary); }
   border-color: var(--success);
 }
 
+.source-no-link {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 4px;
+  border: 1px dashed var(--border);
+  color: var(--text-secondary);
+  opacity: 0.7;
+  user-select: none;
+}
+
 /* ---- citation marker ---- */
 .citation-marker {
   color: var(--primary);

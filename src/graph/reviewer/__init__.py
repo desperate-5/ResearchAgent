@@ -62,6 +62,7 @@ async def assess_sources(state: dict, user_query: str = "") -> ReviewerOutput:
         assessments=assessments,
         summary=global_result.summary,
         gaps=list(global_result.gaps),
+        needs_refetch=bool(global_result.needs_refetch),
     )
 
 

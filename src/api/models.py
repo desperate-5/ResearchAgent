@@ -61,9 +61,14 @@ class FeedbackRequest(BaseModel):
     comment: str = Field(default="", description="自由文本补充")
 
 
-# ---- 方案选择（人机协同） ----
+# ---- 人机交互恢复（通用） ----
 
-class PlanResumeRequest(BaseModel):
+class ResumeRequest(BaseModel):
     project_id: str = Field(..., description="项目 ID")
+    type: str = Field(default="plan_options", description="交互类型：plan_options / query_clarification")
+    # plan_options
     chosen_plan_id: str = Field(default="", description="用户选择的预制方案 ID")
     custom_plan_text: str = Field(default="", description="用户自定义的方案文本")
+    # query_clarification
+    selected_direction: str = Field(default="", description="用户选择的澄清方向")
+    use_original: bool = Field(default=False, description="是否按原始问题检索")

@@ -9,7 +9,8 @@ from .nodes import (
     reviewer_node,
     generate_response_node,
 )
-from .router import route_from_supervisor
+from .query_triage import query_triage_node
+from .router import route_from_supervisor, route_after_triage
 
 
 def build_graph(checkpointer=None):
@@ -17,6 +18,7 @@ def build_graph(checkpointer=None):
     graph = StateGraph(AgentState)
 
     graph.add_node("load_context", load_context_node)
+    graph.add_node("query_triage", query_triage_node)
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("researcher", researcher_node)
     graph.add_node("planner", planner_node)
@@ -24,7 +26,12 @@ def build_graph(checkpointer=None):
     graph.add_node("generate_response", generate_response_node)
 
     graph.add_edge(START, "load_context")
-    graph.add_edge("load_context", "supervisor")
+    graph.add_edge("load_context", "query_triage")
+    graph.add_conditional_edges(
+        "query_triage",
+        route_after_triage,
+        {"supervisor": "supervisor", "end": END},
+    )
 
     graph.add_conditional_edges(
         "supervisor",

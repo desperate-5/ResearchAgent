@@ -23,3 +23,18 @@ def get_recent_messages(state: dict) -> list:
     all_messages = list(state["messages"])
     conv_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
     return last_n_turns(conv_msgs, MAX_CONTEXT_TURNS)
+
+
+def extract_user_query(state: dict) -> str:
+    """从消息列表中提取最新的用户消息文本（作为检索 / 判断用的原始问题）。"""
+    all_messages = list(state.get("messages", []))
+    for m in reversed(all_messages):
+        if hasattr(m, "type") and m.type == "human":
+            content = m.content
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        return part.get("text", "")
+    return ""

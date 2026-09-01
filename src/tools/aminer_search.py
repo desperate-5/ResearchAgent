@@ -152,12 +152,16 @@ def aminer_search_papers(query: str, count: int = 5) -> str:
         year = p.get("year", "")
         citations = p.get("n_citation_bucket", "")
         doi = p.get("doi", "")
+        pid = p.get("id", "")
 
         line = f"{i}. [paper] {title}\n"
         if venue_name or year:
             line += f"   来源: {venue_name}{' (' + str(year) + ')' if year else ''}\n"
         if doi:
             line += f"   链接: https://doi.org/{doi}\n"
+        elif pid:
+            # 无 DOI 时兜底到 AMiner 论文页，保证来源可打开
+            line += f"   链接: https://www.aminer.cn/pub/{pid}\n"
         extra_parts = []
         if first_author:
             extra_parts.append(f"第一作者: {first_author}")

@@ -1,9 +1,17 @@
-"""对话压缩：把长对话历史压缩为结构化摘要，供后续请求复用。"""
+"""对话摘要：压缩生成（写）与摘要注入（读）。
+
+- compress_conversation: 后台压缩策略（阈值判断 + 窗口裁剪 + 生成 + 持久化）
+- build_summary_injection: 读取项目最新摘要并格式化为注入上下文的文本
+"""
 
 import os
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
+
+from ..graph.prompts import COMPRESSION_TURN_THRESHOLD
+from ..storage.records import get_summary, save_summary
+from .windowing import count_turns, last_n_turns
 
 
 COMPRESSION_PROMPT = """请将以下对话历史压缩为结构化摘要。保留所有关键信息，丢弃闲聊和冗余内容。
@@ -66,3 +74,29 @@ async def generate_summary(messages: list, existing_summary: str = "") -> str:
     prompt = COMPRESSION_PROMPT.format(conversation=conversation, existing=existing)
     response = await llm.ainvoke([HumanMessage(content=prompt)])
     return response.content
+
+
+def build_summary_injection(project_id: str) -> str:
+    """读取项目最新对话摘要并格式化为注入文本；无摘要返回空字符串。"""
+    summary = get_summary(project_id)
+    if not summary:
+        return ""
+    return f"## 历史对话摘要\n{summary}"
+
+
+async def compress_conversation(project_id: str, messages: list, existing_summary: str = "") -> None:
+    """对话压缩策略：超过阈值时把旧消息压缩为摘要并持久化。
+
+    内部吞掉异常，保证压缩失败不影响主流程（供后台任务调用）。
+    """
+    try:
+        if count_turns(messages) <= COMPRESSION_TURN_THRESHOLD:
+            return
+        recent_msgs = last_n_turns(messages, 5)
+        old_msgs = messages[: len(messages) - len(recent_msgs)]
+        if not old_msgs:
+            return
+        new_summary = await generate_summary(old_msgs, existing_summary)
+        save_summary(project_id, new_summary)
+    except Exception:
+        pass  # 压缩失败不影响主流程

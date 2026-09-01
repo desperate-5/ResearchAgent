@@ -31,6 +31,7 @@ class ReviewerOutput(BaseModel):
     assessments: list[SourceAssessment] = Field(default_factory=list)
     summary: str = ""
     gaps: list[str] = Field(default_factory=list)
+    needs_refetch: bool = False  # 是否明显不足以回答问题、需要补搜（supervisor 据此门控）
 
 
 # ------------------------------------------------------------
@@ -52,8 +53,9 @@ class ConsistencyEntry(BaseModel):
 
 
 class GlobalAssessment(BaseModel):
-    """阶段 2：全局一致性 + 缺口列表 + 质量小结。"""
+    """阶段 2：全局一致性 + 缺口列表 + 质量小结 + 是否需补搜。"""
 
     consistency: list[ConsistencyEntry] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     summary: str = ""
+    needs_refetch: bool = False  # 这批来源是否明显不足、必须补搜

@@ -13,6 +13,13 @@ def _has_plan_intent(state: AgentState) -> bool:
     return False
 
 
+def route_after_triage(state: AgentState) -> str:
+    """query_triage 之后的路由：无效输入直接结束，否则进入 supervisor。"""
+    if state.get("query_invalid", False):
+        return "end"
+    return "supervisor"
+
+
 def route_from_supervisor(state: AgentState) -> str:
     """根据 supervisor 的决策路由到对应子 agent 或生成回复。"""
     next_agent = state.get("next_agent", "FINISH")

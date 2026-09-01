@@ -36,7 +36,7 @@ export interface SourceItem {
   section?: string;
   position?: string;
   chunk_index?: number;
-  credibility?: "高" | "中" | "低";
+  credibility?: "高" | "中" | "低" | "未评级";
 }
 
 export interface SourceRating {
@@ -52,6 +52,7 @@ export type SSEEvent =
   | { type: "source"; sources: SourceItem[]; message_index: number }
   | { type: "source_ratings"; ratings: SourceRating[]; message_index: number }
   | { type: "plan_options"; options: PlanOption[]; message_index: number }
+  | { type: "query_clarification"; directions: string[]; message_index: number }
   | { type: "done" };
 
 export interface PlanOption {
@@ -60,6 +61,53 @@ export interface PlanOption {
   description: string;
   pros: string[];
   cons: string[];
+}
+
+// ---- SSE 通用读取 ----
+
+async function _readSSE(res: Response, onEvent: (event: SSEEvent) => void): Promise<void> {
+  if (!res.ok) throw new Error(await res.text());
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("data: ")) {
+        const json = trimmed.slice(6);
+        if (json) {
+          try {
+            onEvent(JSON.parse(json));
+          } catch {
+            // skip unparseable chunks
+          }
+        }
+      }
+    }
+  }
+
+  // flush remaining buffer
+  const remaining = buffer.trim();
+  if (remaining.startsWith("data: ")) {
+    const json = remaining.slice(6);
+    if (json) {
+      try {
+        onEvent(JSON.parse(json));
+      } catch {
+        // skip
+      }
+    }
+  }
 }
 
 // ---- projects ----
@@ -116,50 +164,7 @@ export function streamChat(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId, message, tools }),
     signal,
-  }).then(async (res) => {
-    if (!res.ok) throw new Error(await res.text());
-    const reader = res.body?.getReader();
-    if (!reader) throw new Error("No response body");
-
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data: ")) {
-          const json = trimmed.slice(6);
-          if (json) {
-            try {
-              onEvent(JSON.parse(json));
-            } catch {
-              // skip unparseable chunks
-            }
-          }
-        }
-      }
-    }
-
-    // flush remaining buffer
-    const remaining = buffer.trim();
-    if (remaining.startsWith("data: ")) {
-      const json = remaining.slice(6);
-      if (json) {
-        try {
-          onEvent(JSON.parse(json));
-        } catch {
-          // skip
-        }
-      }
-    }
-  });
+  }).then((res) => _readSSE(res, onEvent));
 }
 
 export async function getSources(projectId: string): Promise<SourceItem[]> {
@@ -277,47 +282,21 @@ export function resumeChat(
       custom_plan_text: customPlanText,
     }),
     signal,
-  }).then(async (res) => {
-    if (!res.ok) throw new Error(await res.text());
-    const reader = res.body?.getReader();
-    if (!reader) throw new Error("No response body");
+  }).then((res) => _readSSE(res, onEvent));
+}
 
-    const decoder = new TextDecoder();
-    let buffer = "";
+// ---- query clarification resume ----
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data: ")) {
-          const json = trimmed.slice(6);
-          if (json) {
-            try {
-              onEvent(JSON.parse(json));
-            } catch {
-              // skip unparseable chunks
-            }
-          }
-        }
-      }
-    }
-
-    const remaining = buffer.trim();
-    if (remaining.startsWith("data: ")) {
-      const json = remaining.slice(6);
-      if (json) {
-        try {
-          onEvent(JSON.parse(json));
-        } catch {
-          // skip
-        }
-      }
-    }
-  });
+export function resumeClarification(
+  projectId: string,
+  payload: { selected_direction?: string; use_original?: boolean },
+  onEvent: (event: SSEEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return fetch(`${BASE}/chat/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: projectId, type: "query_clarification", ...payload }),
+    signal,
+  }).then((res) => _readSSE(res, onEvent));
 }

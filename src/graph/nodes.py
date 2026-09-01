@@ -6,7 +6,6 @@ import asyncio
 import httpx
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage
 from langgraph.types import interrupt
 from .state import AgentState
 
@@ -14,20 +13,21 @@ from ..tools.web_search import web_search
 from ..tools.aminer_search import aminer_search_papers
 from ..tools.rag_tool import make_rag_tool
 from ..sources.parser import parse_tool_sources
-from ..storage.records import get_latest_plan
+from ..storage.records import get_latest_plan, get_project_sources
 from ..preferences.manager import get_preferences
 from ..preferences.prompt_builder import build_preference_prompt
-from ..context.windowing import get_recent_messages
 from ..context.builders import (
     build_supervisor_context,
     build_planner_context,
     build_generate_context,
+    build_researcher_messages,
 )
+from ..context.compression import build_summary_injection
 from ..context.tool_compression import truncate_output
+from ..context.windowing import extract_user_query
+from ..interaction.types import PlanOptionsPayload
 
 from .prompts import (
-    RESEARCHER_PROMPT,
-    PLANNER_PROMPT,
     PLAN_KEYWORDS,
     MAX_SEARCH_ROUNDS,
 )
@@ -67,9 +67,9 @@ async def load_context_node(state: AgentState) -> dict:
     prefs_text = build_preference_prompt(prefs)
 
     context_parts = []
-    summary = state.get("summary", "")
-    if summary:
-        context_parts.append(f"## 历史对话摘要\n{summary}")
+    summary_injection = build_summary_injection(project_id)
+    if summary_injection:
+        context_parts.append(summary_injection)
     if prefs_text:
         context_parts.append(prefs_text)
 
@@ -86,8 +86,12 @@ async def load_context_node(state: AgentState) -> dict:
         plan_info = f"## 当前项目的研究方案\n{plan_prefix}方案：{latest_plan.get('plan_title', '')}\n{latest_plan.get('plan_detail', '')}"
         context_parts.append(plan_info)
 
+    # 是否已有历史研究内容（摘要或持久化来源），供 supervisor 判断能否跳过重检索直达 planner
+    has_prior_research = bool(summary_injection) or bool(get_project_sources(project_id))
+
     return {
         "system_prompt": "\n\n".join(context_parts),
+        "has_prior_research": has_prior_research,
     }
 
 
@@ -114,33 +118,37 @@ async def supervisor_node(state: AgentState) -> dict:
             "supervisor_log": log + [{"next": "FINISH", "reason": "planner 已完成方案设计，结束调度"}],
         }
 
-    # 关键词启发式：用户明确要求设计研究方案，且 researcher 已有输出 → 强制路由到 planner
-    if "researcher" in agent_outputs:
-        user_query = _extract_user_query(state)
-        matched_kw = [kw for kw in PLAN_KEYWORDS if kw in user_query]
-        print(f"[DEBUG supervisor] agent_outputs keys={list(agent_outputs.keys())}", file=sys.stderr, flush=True)
-        print(f"[DEBUG supervisor] user_query={user_query[:200]!r}", file=sys.stderr, flush=True)
-        print(f"[DEBUG supervisor] PLAN_KEYWORDS matched={matched_kw}", file=sys.stderr, flush=True)
-        if matched_kw:
-            print("[DEBUG supervisor] Forcing route to planner (keyword match)", file=sys.stderr, flush=True)
-            return {
-                "next_agent": "planner",
-                "supervisor_log": log + [{"next": "planner", "reason": "用户明确要求设计研究方案，强制路由到 planner"}],
-            }
-        else:
-            print("[DEBUG supervisor] No PLAN_KEYWORDS match, falling through to LLM", file=sys.stderr, flush=True)
-    else:
-        print(f"[DEBUG supervisor] agent_outputs keys={list(agent_outputs.keys())} (researcher not yet run)", file=sys.stderr, flush=True)
+    # 检索前澄清守门（确定性规则，绕过 LLM）：用户已通过澄清选定专业方向，
+    # 本轮必须先执行检索，禁止 supervisor 直接 FINISH 凭自身知识回答。
+    if state.get("was_clarified") and "researcher" not in agent_outputs:
+        print("[DEBUG supervisor] 澄清已选定方向，强制先执行 researcher", file=sys.stderr, flush=True)
+        return {
+            "next_agent": "researcher",
+            "supervisor_log": log + [{"next": "researcher", "reason": "检索前澄清已选定方向，强制先执行检索"}],
+        }
 
-    # 缺口补搜门控（确定性规则，绕过 LLM）：reviewer 产出缺口且补搜次数未达上限 → 定向补搜
-    gaps = state.get("retrieval_gaps", [])
+    # 方案选择触发（确定性门 + 护栏）：用户明确表达方案意图（关键词）且已有可靠内容 → 强制 planner
+    has_content = bool(agent_outputs.get("researcher")) or bool(state.get("has_prior_research", False))
+    user_query = extract_user_query(state)
+    matched_kw = [kw for kw in PLAN_KEYWORDS if kw in user_query]
+    if matched_kw and has_content:
+        print("[DEBUG supervisor] Forcing route to planner (keyword + content)", file=sys.stderr, flush=True)
+        return {
+            "next_agent": "planner",
+            "supervisor_log": log + [{"next": "planner", "reason": "用户明确要求设计方案且已有研究内容，路由到 planner"}],
+        }
+
+    # 缺口补搜门控（确定性规则，绕过 LLM）：仅当 reviewer 明确判定来源明显不足
+    # （needs_refetch=true）且补搜次数未达上限时才定向补搜；"还能补充更多细节"
+    # 这类可选项不触发补搜，避免每问必二次检索。
     search_round = state.get("search_round", 0)
-    if "researcher" in agent_outputs and gaps and search_round < MAX_SEARCH_ROUNDS:
-        print(f"[DEBUG supervisor] 触发第 {search_round + 1} 次补搜，缺口 {len(gaps)} 个", file=sys.stderr, flush=True)
+    if "researcher" in agent_outputs and state.get("needs_refetch") and search_round < MAX_SEARCH_ROUNDS:
+        gaps = state.get("retrieval_gaps", [])
+        print(f"[DEBUG supervisor] 触发第 {search_round + 1} 次补搜（needs_refetch），缺口 {len(gaps)} 个", file=sys.stderr, flush=True)
         return {
             "next_agent": "researcher",
             "search_round": search_round + 1,
-            "supervisor_log": log + [{"next": "researcher", "reason": f"存在 {len(gaps)} 个信息缺口，触发第 {search_round + 1} 次补搜"}],
+            "supervisor_log": log + [{"next": "researcher", "reason": f"reviewer 判定来源明显不足，触发第 {search_round + 1} 次补搜"}],
         }
 
     llm = get_llm()
@@ -157,6 +165,12 @@ async def supervisor_node(state: AgentState) -> dict:
         next_agent = "FINISH"
         reason = f"LLM 返回了未知 agent '{decision.get('next', '')}'，回退为 FINISH"
 
+    # planner 需有内容支撑：LLM 想直接方案设计但无内容 → 回退检索
+    if next_agent == "planner" and not has_content:
+        print("[DEBUG supervisor] LLM 返回 planner 但无研究内容，回退为 researcher", file=sys.stderr, flush=True)
+        next_agent = "researcher"
+        reason = "缺乏研究内容，先检索再设计方案"
+
     print(f"[DEBUG supervisor] LLM decision: next={next_agent}, reason={reason!r}", file=sys.stderr, flush=True)
     return {
         "next_agent": next_agent,
@@ -165,10 +179,16 @@ async def supervisor_node(state: AgentState) -> dict:
 
 
 async def _verify_source_urls(sources: list[dict], timeout: int = 5) -> list[dict]:
-    """异步 HEAD 请求检查来源 URL 可达性，返回仅保留存活来源的新列表。"""
+    """异步 HEAD 请求检查来源 URL 可达性，返回仅保留存活来源的新列表。
+
+    AMiner 论文页（https://www.aminer.cn/pub/...）是规范 ID 链接，
+    可能被反爬拦截导致探测失败，但并非死链，不参与过滤。
+    """
     urls = [s["url"] for s in sources if s.get("url")]
     if not urls:
         return sources
+
+    AMINER_PUB_PREFIX = "https://www.aminer.cn/pub/"
 
     async def _check_one(client: httpx.AsyncClient, url: str) -> tuple[str, bool]:
         try:
@@ -190,7 +210,9 @@ async def _verify_source_urls(sources: list[dict], timeout: int = 5) -> list[dic
         results = await asyncio.gather(*tasks)
 
     alive = {url for url, ok in results if ok}
-    dead = [url for url, ok in results if not ok]
+    # AMiner 论文页：探测失败（反爬/超时）不视为死链，保底保留
+    alive |= {u for u in urls if u.startswith(AMINER_PUB_PREFIX)}
+    dead = [url for url, ok in results if not ok and url not in alive]
 
     if dead:
         print(f"[researcher] 过滤掉 {len(dead)} 个死链: {dead}", file=sys.stderr, flush=True)
@@ -201,27 +223,19 @@ async def _verify_source_urls(sources: list[dict], timeout: int = 5) -> list[dic
 async def researcher_node(state: AgentState) -> dict:
     """文献检索 agent。LLM 决定调用哪些工具，并行执行后直接返回原始结果（不做二次总结）。"""
     llm = get_llm()
-    user_msgs = get_recent_messages(state)
-    context = state.get("system_prompt", "")
     project_id = state["project_id"]
 
     # 补搜轮：search_round > 0 即视为补搜，用缺口作为检索 query
     is_refetch = state.get("search_round", 0) > 0
+    gaps = state.get("retrieval_gaps", []) if is_refetch else []
+    _effective = _effective_query(state)
     if is_refetch:
-        gaps = state.get("retrieval_gaps", [])
-        _query = " ".join(gaps) or _extract_user_query(state)
+        _query = " ".join(gaps) or _effective
     else:
-        _query = _extract_user_query(state)
+        _query = _effective
 
-    full_prompt = RESEARCHER_PROMPT
-    if is_refetch:
-        full_prompt += (
-            "\n\n## 补搜指令\n"
-            "这是补搜轮。上一轮检索遗漏了以下信息缺口，请针对这些缺口定向补搜：\n"
-            + "\n".join(f"- {g}" for g in gaps)
-        )
-    if context:
-        full_prompt += f"\n\n## 上下文信息\n{context}"
+    # 消息列表组装统一走 context 模块
+    msgs = build_researcher_messages(state, is_refetch=is_refetch, gaps=gaps)
 
     tools = [web_search, aminer_search_papers, make_rag_tool(project_id)]
 
@@ -320,7 +334,6 @@ async def researcher_node(state: AgentState) -> dict:
     # LLM 工具决策：由 LLM 决定调用哪些工具
     llm_with_tools = llm.bind_tools(tools)
 
-    msgs = [SystemMessage(content=full_prompt)] + user_msgs
     response = await llm_with_tools.ainvoke(msgs)
 
     if not response.tool_calls:
@@ -360,7 +373,7 @@ async def reviewer_node(state: AgentState) -> dict:
     """学术评审 agent：规则信号 + LLM 两阶段评估，输出评分卡 + 小结 + 缺口。"""
     import time
     t0 = time.time()
-    user_query = _extract_user_query(state)
+    user_query = _effective_query(state)
     result = await assess_sources(state, user_query=user_query)
     t1 = time.time()
     print(f"[DEBUG reviewer] assess_sources took {t1 - t0:.1f}s, {len(result.assessments)} assessments, {len(result.gaps)} gaps", file=sys.stderr, flush=True)
@@ -383,6 +396,7 @@ async def reviewer_node(state: AgentState) -> dict:
         "source_ratings": source_ratings,
         "source_assessments": assessments,
         "retrieval_gaps": result.gaps,
+        "needs_refetch": bool(result.needs_refetch),
     }
 
 
@@ -394,10 +408,7 @@ async def planner_node(state: AgentState) -> dict:
     plan_options = _parse_plan_options(response.content)
 
     # 暂停图执行，将候选方案抛给前端
-    user_choice = interrupt({
-        "type": "plan_options",
-        "options": plan_options,
-    })
+    user_choice = interrupt(PlanOptionsPayload(options=plan_options).to_dict())
     # ─── 图在此暂停，用户选择后通过 /chat/resume 恢复 ───
 
     # 解析用户选择：可能是预制方案 ID 或自定义文本
@@ -484,19 +495,9 @@ def _parse_decision(text: str) -> dict:
     return {"next": "FINISH", "reason": "无法解析决策，默认结束"}
 
 
-def _extract_user_query(state: AgentState) -> str:
-    """从消息列表中提取最新的用户消息作为 RAG 查询。"""
-    all_messages = list(state["messages"])
-    for m in reversed(all_messages):
-        if hasattr(m, "type") and m.type == "human":
-            content = m.content
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        return part.get("text", "")
-    return ""
+def _effective_query(state: AgentState) -> str:
+    """澄清后的有效查询，未澄清时回退到原始用户输入。"""
+    return state.get("effective_query", "") or extract_user_query(state)
 
 
 def _parse_plan_options(text: str) -> list[dict]:

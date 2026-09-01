@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useParams } from "react-router-dom";
-import { streamChat, resumeChat, getHistory, listProjects, getSources } from "../api/client";
+import { streamChat, resumeChat, resumeClarification, getHistory, listProjects, getSources } from "../api/client";
 import type { SSEEvent, PlanOption, Project } from "../api/client";
 import ToolCallCard from "../components/ToolCallCard";
 import PlanCard from "../components/PlanCard";
+import QueryClarificationCard from "../components/QueryClarificationCard";
 import FeedbackButtons from "../components/FeedbackButtons";
 import FileUpload from "../components/FileUpload";
 import ReportExport from "../components/ReportExport";
@@ -54,11 +55,13 @@ export default function ChatPage() {
   const [isDragging, setIsDragging] = useState(false);
   const [planOptions, setPlanOptions] = useState<PlanOption[] | null>(null);
   const [, setPlanMessageIndex] = useState(0);
+  const [clarification, setClarification] = useState<string[] | null>(null);
   const messagesEnd = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const sendingRef = useRef(false);
   const messageIndexRef = useRef(0);
+  const followStreamRef = useRef(true); // 流式滚动跟随开关：用户上翻阅读时暂停，回到底部自动恢复
 
   // load project name and history
   useEffect(() => {
@@ -107,14 +110,24 @@ export default function ChatPage() {
     }
   }, [loadingHistory]);
 
+  // 流式逐行跟随：有新内容且用户未上翻时，直接滚动到底部逐行显示最新内容；
+  // 用户上翻阅读时暂停跟随（可自由查看历史），回到底部后自动恢复跟随
   useEffect(() => {
     const container = messagesRef.current;
     if (!container) return;
-    const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50;
-    if (atBottom) {
-      scrollToBottom(true);
+    if (followStreamRef.current) {
+      container.scrollTop = container.scrollHeight;
     }
   }, [messages]);
+
+  // 流式结束后再校准一次（反馈按钮等布局变化后保持贴底）
+  useEffect(() => {
+    const container = messagesRef.current;
+    if (!container) return;
+    if (!streaming && followStreamRef.current) {
+      container.scrollTop = container.scrollHeight;
+    }
+  }, [streaming]);
 
   // citation marker click handler (delegated)
   useEffect(() => {
@@ -142,6 +155,8 @@ export default function ChatPage() {
       if (!container) return;
       const dist = container.scrollHeight - container.scrollTop - container.clientHeight;
       setShowScrollBtn(dist > 200);
+      // 距底部 < 80px 视为贴底：恢复自动跟随；上翻更多则暂停跟随
+      followStreamRef.current = dist < 80;
     };
     container.addEventListener("scroll", handleScroll, { passive: true });
     return () => container.removeEventListener("scroll", handleScroll);
@@ -212,6 +227,8 @@ export default function ChatPage() {
     setSources([]);
     setHighlightedSourceNum(undefined);
     setPlanOptions(null);
+    setClarification(null);
+    followStreamRef.current = true; // 新回合开始：恢复流式滚动跟随
 
     const assistantMsg: ChatMessage = { role: "assistant", content: "", toolCalls: [] };
     setMessages((prev) => [...prev, assistantMsg]);
@@ -310,6 +327,8 @@ export default function ChatPage() {
               next.delete("planner");
               return next;
             });
+          } else if (event.type === "query_clarification") {
+            setClarification(event.directions);
           } else if (event.type === "done") {
             setActiveAgents(new Set());
             setStreaming(false);
@@ -338,115 +357,107 @@ export default function ChatPage() {
     }
   }, [input, projectId, selectedTools]);
 
+  const handleResumeEvent = useCallback(
+    (event: SSEEvent, seenTools: Set<string>, toolIdCounter: { n: number }) => {
+      if (event.type === "response") {
+        setMessages((prev) => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last && last.role === "assistant") {
+            updated[updated.length - 1] = { ...last, content: last.content + event.content };
+          }
+          return updated;
+        });
+      } else if (event.type === "tool_call") {
+        if (event.status === "start") {
+          if (!seenTools.has(event.tool)) {
+            seenTools.add(event.tool);
+            const tc: ToolCallEvent = { tool: event.tool, status: "start", id: ++toolIdCounter.n, agent: event.agent };
+            setMessages((prev) => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last && last.role === "assistant") {
+                updated[updated.length - 1] = { ...last, toolCalls: [...last.toolCalls, tc] };
+              }
+              return updated;
+            });
+          }
+        } else {
+          setMessages((prev) => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            if (last && last.role === "assistant") {
+              updated[updated.length - 1] = {
+                ...last,
+                toolCalls: last.toolCalls.map((tc) =>
+                  tc.tool === event.tool ? { ...tc, status: "end" as const } : tc
+                ),
+              };
+            }
+            return updated;
+          });
+        }
+      } else if (event.type === "agent_phase") {
+        setActiveAgents((prev) => {
+          const next = new Set(prev);
+          if (event.status === "start") next.add(event.agent);
+          else next.delete(event.agent);
+          return next;
+        });
+      } else if (event.type === "source") {
+        const mi = event.message_index;
+        setSources((prev) => {
+          const seen = new Set(prev.map((s) => s.id || `${s.url}__${s.title}`));
+          const newSources = event.sources
+            .filter((s) => !seen.has(s.id || `${s.url}__${s.title}`))
+            .map((s) => ({ ...s, message_index: mi }));
+          return newSources.length > 0 ? [...prev, ...newSources] : prev;
+        });
+      } else if (event.type === "source_ratings") {
+        setSources((prev) =>
+          prev.map((s) => {
+            const rating = event.ratings.find((r) => r.source_number === s.source_number);
+            return rating
+              ? { ...s, credibility: rating.credibility }
+              : s.credibility
+                ? s
+                : { ...s, credibility: "未评级" };
+          }),
+        );
+      } else if (event.type === "plan_options") {
+        setPlanOptions(event.options);
+        setPlanMessageIndex(event.message_index);
+        setActiveAgents((prev) => {
+          const next = new Set(prev);
+          next.delete("planner");
+          return next;
+        });
+      } else if (event.type === "query_clarification") {
+        setClarification(event.directions);
+      } else if (event.type === "done") {
+        setActiveAgents(new Set());
+        setStreaming(false);
+      }
+    },
+    [],
+  );
+
   const handlePlanSelect = useCallback(async (chosenPlanId: string, customPlanText: string) => {
     if (!projectId || sendingRef.current) return;
     sendingRef.current = true;
-
-    // 清除弹窗，进入等待状态
     setPlanOptions(null);
     setStreaming(true);
+    followStreamRef.current = true; // 恢复方案选择后的流式跟随
 
     const abort = new AbortController();
     abortRef.current = abort;
 
     const seenTools = new Set<string>();
-    let toolIdCounter = 0;
+    const toolIdCounter = { n: 0 };
     const currentMsgIndex = messageIndexRef.current;
 
     try {
-      await resumeChat(
-        projectId,
-        chosenPlanId,
-        customPlanText,
-        (event: SSEEvent) => {
-          if (event.type === "response") {
-            setMessages((prev) => {
-              const updated = [...prev];
-              const last = updated[updated.length - 1];
-              if (last && last.role === "assistant") {
-                updated[updated.length - 1] = {
-                  ...last,
-                  content: last.content + event.content,
-                };
-              }
-              return updated;
-            });
-          } else if (event.type === "tool_call") {
-            if (event.status === "start") {
-              if (!seenTools.has(event.tool)) {
-                seenTools.add(event.tool);
-                const tc: ToolCallEvent = { tool: event.tool, status: "start", id: ++toolIdCounter, agent: event.agent };
-                setMessages((prev) => {
-                  const updated = [...prev];
-                  const last = updated[updated.length - 1];
-                  if (last && last.role === "assistant") {
-                    updated[updated.length - 1] = {
-                      ...last,
-                      toolCalls: [...last.toolCalls, tc],
-                    };
-                  }
-                  return updated;
-                });
-              }
-            } else {
-              setMessages((prev) => {
-                const updated = [...prev];
-                const last = updated[updated.length - 1];
-                if (last && last.role === "assistant") {
-                  updated[updated.length - 1] = {
-                    ...last,
-                    toolCalls: last.toolCalls.map((tc) =>
-                      tc.tool === event.tool ? { ...tc, status: "end" as const } : tc
-                    ),
-                  };
-                }
-                return updated;
-              });
-            }
-          } else if (event.type === "agent_phase") {
-            setActiveAgents((prev) => {
-              const next = new Set(prev);
-              if (event.status === "start") {
-                next.add(event.agent);
-              } else {
-                next.delete(event.agent);
-              }
-              return next;
-            });
-          } else if (event.type === "source") {
-            const mi = event.message_index;
-            setSources((prev) => {
-              const seen = new Set(prev.map((s) => s.id || `${s.url}__${s.title}`));
-              const newSources = event.sources
-                .filter((s) => !seen.has(s.id || `${s.url}__${s.title}`))
-                .map((s) => ({ ...s, message_index: mi }));
-              return newSources.length > 0 ? [...prev, ...newSources] : prev;
-            });
-          } else if (event.type === "source_ratings") {
-            setSources((prev) =>
-              prev.map((s) => {
-                const rating = event.ratings.find(
-                  (r) => r.source_number === s.source_number,
-                );
-                return rating ? { ...s, credibility: rating.credibility } : s;
-              }),
-            );
-          } else if (event.type === "plan_options") {
-            // 防御：如果 resume 后又触发了 planner interrupt
-            setPlanOptions(event.options);
-            setPlanMessageIndex(event.message_index);
-            setActiveAgents((prev) => {
-              const next = new Set(prev);
-              next.delete("planner");
-              return next;
-            });
-          } else if (event.type === "done") {
-            setActiveAgents(new Set());
-            setStreaming(false);
-          }
-        },
-        abort.signal,
-      );
+      await resumeChat(projectId, chosenPlanId, customPlanText, (event) => handleResumeEvent(event, seenTools, toolIdCounter), abort.signal);
     } catch (e: unknown) {
       if (e instanceof DOMException && e.name === "AbortError") return;
       const msg = e instanceof Error ? e.message : "Stream error";
@@ -464,7 +475,44 @@ export default function ChatPage() {
       abortRef.current = null;
       messageIndexRef.current = currentMsgIndex + 1;
     }
-  }, [projectId]);
+  }, [projectId, handleResumeEvent]);
+
+  const handleClarificationResume = useCallback(async (
+    payload: { selected_direction?: string; use_original?: boolean },
+  ) => {
+    if (!projectId || sendingRef.current) return;
+    sendingRef.current = true;
+    setClarification(null);
+    setStreaming(true);
+    followStreamRef.current = true; // 恢复澄清选择后的流式跟随
+
+    const abort = new AbortController();
+    abortRef.current = abort;
+
+    const seenTools = new Set<string>();
+    const toolIdCounter = { n: 0 };
+    const currentMsgIndex = messageIndexRef.current;
+
+    try {
+      await resumeClarification(projectId, payload, (event) => handleResumeEvent(event, seenTools, toolIdCounter), abort.signal);
+    } catch (e: unknown) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      const msg = e instanceof Error ? e.message : "Stream error";
+      setMessages((prev) => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        if (last && last.role === "assistant") {
+          updated[updated.length - 1] = { ...last, content: last.content + `\n\n[错误: ${msg}]` };
+        }
+        return updated;
+      });
+    } finally {
+      setStreaming(false);
+      sendingRef.current = false;
+      abortRef.current = null;
+      messageIndexRef.current = currentMsgIndex + 1;
+    }
+  }, [projectId, handleResumeEvent]);
 
   const handleStop = () => {
     abortRef.current?.abort();
@@ -540,12 +588,21 @@ export default function ChatPage() {
                 disabled={false}
               />
             )}
+
+            {clarification && (
+              <QueryClarificationCard
+                directions={clarification}
+                onSelectDirection={(d) => handleClarificationResume({ selected_direction: d })}
+                onUseOriginal={() => handleClarificationResume({ use_original: true })}
+                disabled={false}
+              />
+            )}
           </div>
 
           {showScrollBtn && (
             <button
               className="scroll-to-bottom"
-              onClick={() => scrollToBottom(true)}
+              onClick={() => { followStreamRef.current = true; scrollToBottom(true); }}
               title="回到底部"
             >
               ↓

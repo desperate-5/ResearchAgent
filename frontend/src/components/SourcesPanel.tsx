@@ -29,6 +29,7 @@ const CREDIBILITY_STYLE: Record<string, { bg: string; color: string; label: stri
   "高": { bg: "#dcfce7", color: "#166534", label: "高可信" },
   "中": { bg: "#fef9c3", color: "#854d0e", label: "中可信" },
   "低": { bg: "#ffedd5", color: "#9a3412", label: "低可信" },
+  "未评级": { bg: "#f3f4f6", color: "#6b7280", label: "未评级" },
 };
 
 export default function SourcesPanel({ sources, onJumpToMessage, highlightIndex }: SourcesPanelProps) {
@@ -91,7 +92,7 @@ export default function SourcesPanel({ sources, onJumpToMessage, highlightIndex 
                 <div className="source-domain">{getDomain(s.url)}</div>
               )}
               <div className="source-actions">
-                {s.url && (
+                {s.url ? (
                   <button
                     className="source-btn source-btn-open"
                     onClick={() => window.open(s.url, "_blank", "noopener")}
@@ -99,6 +100,13 @@ export default function SourcesPanel({ sources, onJumpToMessage, highlightIndex 
                   >
                     打开原文
                   </button>
+                ) : (
+                  <span
+                    className="source-no-link"
+                    title="该来源没有可打开的外部链接（如论文未提供 DOI）"
+                  >
+                    无原文链接
+                  </span>
                 )}
                 <button
                   className="source-btn source-btn-jump"
