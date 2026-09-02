@@ -14,8 +14,8 @@ from ..tools.aminer_search import aminer_search_papers
 from ..tools.rag_tool import make_rag_tool
 from ..sources.parser import parse_tool_sources
 from ..storage.records import get_latest_plan, get_project_sources
-from ..preferences.manager import get_preferences
 from ..preferences.prompt_builder import build_preference_prompt
+from ..preferences.store import compute_effective
 from ..context.builders import (
     build_supervisor_context,
     build_planner_context,
@@ -63,8 +63,16 @@ async def load_context_node(state: AgentState) -> dict:
     """加载上下文：偏好配置、历史摘要、项目文件列表。不做自动 RAG 注入（由 researcher 按需检索）。"""
     project_id = state["project_id"]
 
-    prefs = get_preferences()
-    prefs_text = build_preference_prompt(prefs)
+    profile = compute_effective(project_id)
+    prefs_parts = []
+    base_prefs = build_preference_prompt(profile.config)
+    if base_prefs:
+        prefs_parts.append(base_prefs)
+    if profile.domain:
+        prefs_parts.append(f"用户关注的研究领域：{profile.domain}")
+    if profile.method:
+        prefs_parts.append(f"用户偏好的研究方法：{profile.method}")
+    prefs_text = "\n".join(prefs_parts)
 
     context_parts = []
     summary_injection = build_summary_injection(project_id)

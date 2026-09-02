@@ -442,7 +442,7 @@ export default function ChatPage() {
     [],
   );
 
-  const handlePlanSelect = useCallback(async (chosenPlanId: string, customPlanText: string) => {
+  const handlePlanSelect = useCallback(async (chosenPlanId: string, customPlanText: string, planTitle?: string) => {
     if (!projectId || sendingRef.current) return;
     sendingRef.current = true;
     setPlanOptions(null);
@@ -457,7 +457,7 @@ export default function ChatPage() {
     const currentMsgIndex = messageIndexRef.current;
 
     try {
-      await resumeChat(projectId, chosenPlanId, customPlanText, (event) => handleResumeEvent(event, seenTools, toolIdCounter), abort.signal);
+      await resumeChat(projectId, chosenPlanId, customPlanText, (event) => handleResumeEvent(event, seenTools, toolIdCounter), abort.signal, planTitle ?? "");
     } catch (e: unknown) {
       if (e instanceof DOMException && e.name === "AbortError") return;
       const msg = e instanceof Error ? e.message : "Stream error";

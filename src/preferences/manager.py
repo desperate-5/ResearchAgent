@@ -1,7 +1,7 @@
 import json
 import os
 import yaml
-from .models import PreferencesConfig, LiteraturePref, WritingPref, ExperimentPref, ToolPref
+from .models import PreferencesConfig, LiteraturePref, WritingPref, ExperimentPref
 
 PREFERENCES_FILE = os.path.join("data", "preferences.md")
 
@@ -32,14 +32,6 @@ FEEDBACK_RULES: dict[str, tuple[str, str, object]] = {
     "需要显著性检验": ("experiment", "significance_test", True),
     "需要消融实验": ("experiment", "require_ablation", True),
     "需要统计分析": ("experiment", "significance_test", True),
-    # tool
-    "用 Python 画图": ("tool", "prefer_python", True),
-    "优先 arxiv": ("tool", "prefer_arxiv", True),
-    "少用知网": ("tool", "avoid_cnki", True),
-    "优先学术搜索": ("tool", "prefer_arxiv", True),
-    "用 matplotlib": ("tool", "plot_library", "matplotlib"),
-    "用 seaborn": ("tool", "plot_library", "seaborn"),
-    "用 plotly": ("tool", "plot_library", "plotly"),
 }
 
 
@@ -89,19 +81,8 @@ def _generate_default_md() -> str:
 |------|------|------|
 | `metrics` | list | 关注指标，如 `["accuracy", "F1"]` |
 | `require_control` | bool | 是否要求对照组 |
-| `viz_tool` | string | 图表工具：`matplotlib`、`seaborn`、`plotly` |
 | `significance_test` | bool | 是否要求显著性检验 |
 | `require_ablation` | bool | 是否要求消融实验 |
-
-## 工具偏好 (tool)
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `prefer_python` | bool | 优先用 Python 绘图 |
-| `prefer_arxiv` | bool | 优先检索 arXiv |
-| `avoid_cnki` | bool | 避免使用知网 |
-| `search_priority` | string | 搜索优先级：`arxiv`、`semantic_scholar`、`web` |
-| `plot_library` | string | 绑图库：`matplotlib`、`seaborn`、`plotly` |
 """
 
 
@@ -171,7 +152,6 @@ def get_preferences() -> PreferencesConfig:
         literature=_build(LiteraturePref, "literature"),
         writing=_build(WritingPref, "writing"),
         experiment=_build(ExperimentPref, "experiment"),
-        tool=_build(ToolPref, "tool"),
     )
 
 

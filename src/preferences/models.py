@@ -1,3 +1,5 @@
+import json
+
 from pydantic import BaseModel, Field
 
 
@@ -25,18 +27,8 @@ class ExperimentPref(BaseModel):
     """实验分析偏好"""
     metrics: list[str] = Field(default_factory=list, description="评估指标：accuracy, F1, AUC 等")
     require_control: bool = Field(default=False, description="需要对照组")
-    viz_tool: str = Field(default="", description="matplotlib / seaborn / plotly")
     significance_test: bool = Field(default=False, description="需要显著性检验")
     require_ablation: bool = Field(default=False, description="需要消融实验")
-
-
-class ToolPref(BaseModel):
-    """工具调用偏好"""
-    prefer_python: bool = Field(default=False, description="优先用 Python 绘图")
-    prefer_arxiv: bool = Field(default=False, description="优先检索 arXiv")
-    avoid_cnki: bool = Field(default=False, description="避免使用知网")
-    search_priority: str = Field(default="", description="arxiv / semantic_scholar / web")
-    plot_library: str = Field(default="", description="matplotlib / seaborn / plotly")
 
 
 class PreferencesConfig(BaseModel):
@@ -44,4 +36,67 @@ class PreferencesConfig(BaseModel):
     literature: LiteraturePref = Field(default_factory=LiteraturePref)
     writing: WritingPref = Field(default_factory=WritingPref)
     experiment: ExperimentPref = Field(default_factory=ExperimentPref)
-    tool: ToolPref = Field(default_factory=ToolPref)
+
+
+# ============================================================
+# 偏好进化：学习层 / 证据层模型（§五 四层结构）
+# ============================================================
+
+# 学习层可识别的维度及其合法取值（None = 自由文本，如 domain/method）
+KNOWN_DIMENSIONS: dict[str, set | None] = {
+    "writing.sentence_style": {"concise", "elaborate"},
+    "writing.figure_norm": {"tight", "spacious"},
+    "writing.abstract_style": {"structured", "narrative"},
+    "writing.ref_format": {"GB/T 7714", "APA", "IEEE"},
+    "writing.lang": {"chinese", "english"},
+    "literature.source_type": {"journal", "conference", "both"},
+    "literature.paper_type": {"review", "experimental", "both"},
+    "literature.preferred_language": {"chinese", "english", "both"},
+    "domain": None,
+    "method": None,
+}
+
+
+class PreferenceCandidate(BaseModel):
+    """LLM 提取出的单条偏好候选（陈述式显式 / 选择式显式）。"""
+    dimension: str
+    value: str
+    evidence: str = ""
+
+
+class ObservedCandidate(BaseModel):
+    """会话蒸馏产出的隐性偏好候选（观察式，带多条原句证据）。"""
+    dimension: str
+    value: str
+    evidence: list[str] = Field(default_factory=list)
+
+
+class ProfileItemRow(BaseModel):
+    """学习层 profile_items 表的一行（Beta 账本：μ = a/(a+b)）。"""
+    id: int | None = None
+    scope: str = "global"          # global | project
+    project_id: str = ""           # scope=project 时关联项目
+    dimension: str
+    value: str
+    a: float = 1.0
+    b: float = 1.0
+    source: str = "explicit"       # explicit | choice | observed | manual
+    applied: int = 0               # 当前是否生效
+    user_locked: int = 0           # 手动层锁定保护
+    last_seen: str = ""            # 衰减计时
+    evidence_json: str = "[]"
+
+    @property
+    def mu(self) -> float:
+        s = self.a + self.b
+        return self.a / s if s > 0 else 0.0
+
+    @property
+    def evidence_list(self) -> list[str]:
+        try:
+            data = json.loads(self.evidence_json or "[]")
+            if isinstance(data, list):
+                return [str(x) for x in data]
+        except Exception:
+            pass
+        return []

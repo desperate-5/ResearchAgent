@@ -26,14 +26,13 @@ def init_db():
     )
     if cursor.fetchone():
         row = conn.execute(
-            "SELECT literature, writing, experiment, tool FROM user_preferences WHERE id = 1"
+            "SELECT literature, writing, experiment FROM user_preferences WHERE id = 1"
         ).fetchone()
         if row and not os.path.exists(os.path.join("data", "preferences.md")):
             lit = json.loads(row["literature"] or "{}")
             wrt = json.loads(row["writing"] or "{}")
             exp = json.loads(row["experiment"] or "{}")
-            tool = json.loads(row["tool"] or "{}")
-            yaml_dict = {"literature": lit, "writing": wrt, "experiment": exp, "tool": tool}
+            yaml_dict = {"literature": lit, "writing": wrt, "experiment": exp}
             import yaml as _yaml
             yaml_block = _yaml.dump(yaml_dict, allow_unicode=True, default_flow_style=False, sort_keys=False).strip()
             os.makedirs("data", exist_ok=True)
@@ -84,6 +83,35 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, id);
         CREATE INDEX IF NOT EXISTS idx_summaries_project ON summaries(project_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_plans_project ON project_plans(project_id, created_at);
+        CREATE TABLE IF NOT EXISTS profile_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL DEFAULT 'global',
+            project_id TEXT NOT NULL DEFAULT '',
+            dimension TEXT NOT NULL,
+            value TEXT NOT NULL,
+            a REAL NOT NULL DEFAULT 1.0,
+            b REAL NOT NULL DEFAULT 1.0,
+            source TEXT NOT NULL DEFAULT 'explicit',
+            applied INTEGER NOT NULL DEFAULT 0,
+            user_locked INTEGER NOT NULL DEFAULT 0,
+            last_seen TEXT NOT NULL DEFAULT '',
+            evidence_json TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE TABLE IF NOT EXISTS interaction_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            message_index INTEGER,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            processed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS profile_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_profile_items_dim ON profile_items(scope, project_id, dimension);
+        CREATE INDEX IF NOT EXISTS idx_events_project ON interaction_events(project_id, processed);
     ''')
     conn.commit()
     conn.close()

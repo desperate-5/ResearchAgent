@@ -18,6 +18,8 @@ from ..storage.db import init_db
 from ..storage.records import save_message, get_history, get_summary, save_project_sources, get_project_sources, save_project_plan, get_latest_plan
 from ..storage.projects import create_project, list_projects, get_project, delete_project, rename_project, update_timestamp
 from ..preferences.manager import get_preferences, save_preferences, apply_feedback, get_raw_preferences, save_raw_preferences
+from ..preferences import store as pref_store
+from ..preferences import archival as pref_archival
 from ..rag.store import get_project_files, index_document, delete_project_index
 from ..export.report import generate_report
 from ..interaction.events import iter_interrupt_events
@@ -37,6 +39,11 @@ async def _background_compress(project_id: str, graph_state):
         list(state_values.get("messages", [])),
         state_values.get("summary", ""),
     )
+
+
+async def _background_archival(project_id: str):
+    """后台执行偏好学习管线（证据采集 → 判断 → 更新）。不阻塞当前响应。"""
+    await pref_archival.run_archival(project_id)
 
 
 @asynccontextmanager
@@ -120,16 +127,15 @@ def api_get_preferences():
 
 @app.put("/preferences")
 def api_update_preferences(req: UpdatePreferencesRequest):
-    # 合并：只更新传入的非空字段
+    # 字段级合并：只更新请求体里显式提供的字段，避免整类替换把未改字段重置为默认值
     current = get_preferences()
-    if req.literature is not None:
-        current.literature = req.literature
-    if req.writing is not None:
-        current.writing = req.writing
-    if req.experiment is not None:
-        current.experiment = req.experiment
-    if req.tool is not None:
-        current.tool = req.tool
+    for category in ("literature", "writing", "experiment"):
+        sub = getattr(req, category, None)
+        if sub is None:
+            continue
+        cur_sub = getattr(current, category)
+        for field in sub.model_fields_set:
+            setattr(cur_sub, field, getattr(sub, field))
     save_preferences(current)
     return current
 
@@ -151,6 +157,22 @@ def api_update_raw_preferences(req: RawPreferencesRequest):
     return {
         "status": "saved",
         "preferences": parsed.model_dump() if parsed else None,
+    }
+
+
+# ============================================================
+# 学习层画像 API（审计 / 调试：查看系统学习到的偏好与证据）
+# ============================================================
+
+@app.get("/preferences/learned")
+def api_get_learned(project_id: str = ""):
+    """返回学习层 profile_items 与证据层 interaction_events（审计视图）。"""
+    items = pref_store.list_profile_items(project_id or None)
+    events = pref_store.list_interaction_events(project_id or None)
+    return {
+        "project_id": project_id,
+        "profile_items": [i.model_dump() for i in items],
+        "interaction_events": events,
     }
 
 
@@ -507,6 +529,7 @@ async def chat(request: ChatRequest, req: Request):
                 for ev in interaction_events:
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 asyncio.create_task(_background_compress(request.project_id, graph_state))
+                asyncio.create_task(_background_archival(request.project_id))
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
@@ -537,6 +560,7 @@ async def chat(request: ChatRequest, req: Request):
             if all_sources:
                 save_project_sources(request.project_id, all_sources)
             asyncio.create_task(_background_compress(request.project_id, graph_state))
+            asyncio.create_task(_background_archival(request.project_id))
             # 本轮对话已正常完成，无需再保留快照：清理该线程的所有 checkpoint，
             # 防止每个 super-step 的完整 state 快照在 checkpoints/writes 表中无限累积。
             # 注意：interrupt 等待期间不清理（resume 需要），仅在此"未中断完成"分支删除。
@@ -568,14 +592,16 @@ async def chat_resume(request: ResumeRequest, req: Request):
     # 通用解析：把请求体解析为 interrupt() 的返回值
     user_choice = parse_resume(request)
 
-    # 方案选择持久化（仅 plan_options 交互）
-    if (request.type or "plan_options") == "plan_options":
+    # 方案选择持久化（仅 plan_options 交互）+ 证据打点（学习层证据采集）
+    message_index = len(get_history(request.project_id))
+    itype = request.type or "plan_options"
+    if itype == "plan_options":
         plan_title = ""
         plan_detail = ""
         is_custom = False
         if request.chosen_plan_id:
-            plan_title = f"方案 {request.chosen_plan_id}"
-            plan_detail = f"用户选择了方案 {request.chosen_plan_id}"
+            plan_title = request.plan_title or f"方案 {request.chosen_plan_id}"
+            plan_detail = f"用户选择了方案「{plan_title}」({request.chosen_plan_id})"
             is_custom = False
         elif request.custom_plan_text:
             plan_title = "自定义方案"
@@ -583,6 +609,26 @@ async def chat_resume(request: ResumeRequest, req: Request):
             is_custom = True
         if plan_detail:
             save_project_plan(request.project_id, request.chosen_plan_id, plan_title, plan_detail, is_custom)
+            pref_store.save_interaction_event(
+                request.project_id,
+                message_index,
+                "plan_choice",
+                {
+                    "plan_id": request.chosen_plan_id,
+                    "plan_title": plan_title,
+                    "plan_type": request.plan_type or "",
+                    "is_custom": is_custom,
+                },
+            )
+    elif itype == "query_clarification":
+        # 澄清方向选择落库（use_original 跳过——用户未真正选择方向）
+        if request.selected_direction and not request.use_original:
+            pref_store.save_interaction_event(
+                request.project_id,
+                message_index,
+                "clarification_choice",
+                {"selected_direction": request.selected_direction, "use_original": False},
+            )
 
     AGENT_NODES = {"supervisor", "researcher", "planner", "reviewer", "generate_response"}
 
@@ -683,6 +729,7 @@ async def chat_resume(request: ResumeRequest, req: Request):
                 for ev in interaction_events:
                     yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 asyncio.create_task(_background_compress(request.project_id, graph_state))
+                asyncio.create_task(_background_archival(request.project_id))
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 return
 
@@ -713,6 +760,7 @@ async def chat_resume(request: ResumeRequest, req: Request):
             if all_sources:
                 save_project_sources(request.project_id, all_sources)
             asyncio.create_task(_background_compress(request.project_id, graph_state))
+            asyncio.create_task(_background_archival(request.project_id))
             try:
                 await app.state.checkpointer.delete_thread(request.project_id)
             except Exception:

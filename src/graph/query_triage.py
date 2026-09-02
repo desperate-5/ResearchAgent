@@ -14,6 +14,7 @@ from .query_rules import rule_reject as _rule_reject
 from .prompts import EXPLICIT_PLAN_KEYWORDS
 from ..interaction.types import QueryClarificationPayload
 from ..context.windowing import extract_user_query
+from ..preferences.store import get_applied_hints
 
 
 CLARIFY_PROMPT = """你是科研助手的检索意图澄清助手。判断用户的问题是否足够清晰、可以直接检索。
@@ -202,6 +203,32 @@ def _has_explicit_plan_intent(text: str) -> bool:
     return any(p in text for p in EXPLICIT_PLAN_KEYWORDS)
 
 
+def _tokens(text: str) -> set[str]:
+    """把方向/领域文本拆成粗粒度 token 集合（用于重叠打分）。"""
+    parts = re.split(r"[：:/\s、,，]+", (text or ""))
+    toks = set()
+    for p in parts:
+        p = p.strip()
+        if p:
+            toks.add(p)
+    for w in list(toks):
+        for i in range(len(w) - 1):
+            toks.add(w[i:i + 2])
+    return toks
+
+
+def _rank_by_domain(directions: list[str], domain: str) -> list[str]:
+    """已生效的 domain 学习条目 → 澄清方向排序置顶（稳定排序，不改变方向集合）。"""
+    if not domain:
+        return directions
+    dom_tokens = _tokens(domain)
+
+    def score(d: str) -> int:
+        return len(dom_tokens & _tokens(d))
+
+    return sorted(directions, key=score, reverse=True)
+
+
 async def query_triage_node(state: AgentState) -> dict:
     """检索前澄清门卫：规则预检 + LLM 分类，需要时中断让用户澄清。
 
@@ -236,5 +263,9 @@ async def query_triage_node(state: AgentState) -> dict:
         return {"effective_query": raw, "was_clarified": False}
 
     directions = await _ensure_directions(raw, verdict.get("directions", []))
+    # M3：已生效的 domain 偏好 → 澄清方向排序置顶（不改变方向集合，仅重排）
+    domain = get_applied_hints(state.get("project_id", "")).get("domain", "")
+    if domain:
+        directions = _rank_by_domain(directions, domain)
     choice = interrupt(QueryClarificationPayload(directions=directions).to_dict())
     return {"effective_query": _resolve_choice(choice, raw), "was_clarified": True}

@@ -3,7 +3,7 @@ import type { PlanOption } from "../api/client";
 
 interface Props {
   options: PlanOption[];
-  onSelect: (chosenPlanId: string, customPlanText: string) => void;
+  onSelect: (chosenPlanId: string, customPlanText: string, planTitle?: string) => void;
   disabled: boolean;
 }
 
@@ -14,9 +14,10 @@ export default function PlanCard({ options, onSelect, disabled }: Props) {
   const handleConfirm = () => {
     if (disabled) return;
     if (selectedId) {
-      onSelect(selectedId, "");
+      const selected = options.find((o) => o.id === selectedId);
+      onSelect(selectedId, "", selected?.title ?? "");
     } else if (customText.trim()) {
-      onSelect("", customText.trim());
+      onSelect("", customText.trim(), "");
     }
   };
 

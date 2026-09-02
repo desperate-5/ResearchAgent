@@ -15,11 +15,35 @@ export interface HistoryMessage {
   created_at: string;
 }
 
+export interface LiteraturePref {
+  source_type: string;
+  year_start: number;
+  year_end: number;
+  paper_type: string;
+  min_citations: number;
+  preferred_venues: string[];
+  preferred_language: string;
+}
+
+export interface WritingPref {
+  sentence_style: string;
+  figure_norm: string;
+  abstract_style: string;
+  ref_format: string;
+  lang: string;
+}
+
+export interface ExperimentPref {
+  metrics: string[];
+  require_control: boolean;
+  significance_test: boolean;
+  require_ablation: boolean;
+}
+
 export interface PreferencesConfig {
-  literature: Record<string, unknown>;
-  writing: Record<string, unknown>;
-  experiment: Record<string, unknown>;
-  tool: Record<string, unknown>;
+  literature: LiteraturePref;
+  writing: WritingPref;
+  experiment: ExperimentPref;
 }
 
 // ---- SSE stream event types ----
@@ -194,25 +218,6 @@ export async function updatePreferences(
   return res.json();
 }
 
-// ---- raw preferences (settings editor) ----
-
-export async function getRawPreferences(): Promise<string> {
-  const res = await fetch(`${BASE}/preferences/raw`);
-  if (!res.ok) throw new Error(await res.text());
-  const data = await res.json();
-  return data.content;
-}
-
-export async function updateRawPreferences(content: string): Promise<unknown> {
-  const res = await fetch(`${BASE}/preferences/raw`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
-}
-
 // ---- feedback ----
 
 export async function sendFeedback(
@@ -272,6 +277,8 @@ export function resumeChat(
   customPlanText: string,
   onEvent: (event: SSEEvent) => void,
   signal?: AbortSignal,
+  planTitle: string = "",
+  planType: string = "",
 ): Promise<void> {
   return fetch(`${BASE}/chat/resume`, {
     method: "POST",
@@ -280,6 +287,8 @@ export function resumeChat(
       project_id: projectId,
       chosen_plan_id: chosenPlanId,
       custom_plan_text: customPlanText,
+      plan_title: planTitle,
+      plan_type: planType,
     }),
     signal,
   }).then((res) => _readSSE(res, onEvent));

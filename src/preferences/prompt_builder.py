@@ -1,4 +1,4 @@
-from .models import PreferencesConfig, LiteraturePref, WritingPref, ExperimentPref, ToolPref
+from .models import PreferencesConfig, LiteraturePref, WritingPref, ExperimentPref
 
 
 def build_preference_prompt(prefs: PreferencesConfig) -> str:
@@ -16,10 +16,6 @@ def build_preference_prompt(prefs: PreferencesConfig) -> str:
     exp = _format_experiment(prefs.experiment)
     if exp:
         sections.append(f"实验分析偏好：{exp}")
-
-    tool = _format_tool(prefs.tool)
-    if tool:
-        sections.append(f"工具偏好：{tool}")
 
     if not sections:
         return ""
@@ -79,25 +75,8 @@ def _format_experiment(p: ExperimentPref) -> str:
         parts.append(f"评估指标：{'、'.join(p.metrics)}")
     if p.require_control:
         parts.append("必须包含对照组")
-    if p.viz_tool:
-        parts.append(f"图表工具：{p.viz_tool}")
     if p.significance_test:
         parts.append("需要显著性检验")
     if p.require_ablation:
         parts.append("需要消融实验")
-    return "；".join(parts)
-
-
-def _format_tool(p: ToolPref) -> str:
-    parts = []
-    if p.prefer_python:
-        parts.append("优先使用 Python 绘图")
-    if p.prefer_arxiv:
-        parts.append("优先检索 arXiv 学术论文库")
-    if p.avoid_cnki:
-        parts.append("避免使用知网检索")
-    if p.search_priority:
-        parts.append(f"搜索优先级：{p.search_priority}")
-    if p.plot_library:
-        parts.append(f"绑图库：{p.plot_library}")
     return "；".join(parts)

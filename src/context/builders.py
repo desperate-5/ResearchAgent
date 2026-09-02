@@ -23,7 +23,8 @@ def build_supervisor_context(state: dict) -> list:
     context = state.get("system_prompt", "")
     agent_outputs = state.get("agent_outputs", {})
 
-    # 有 agent 输出时已经是第二轮调度，用精简 prompt 省 token（减少 LLM 处理时间 ~0.5s）
+    # 有 agent 输出时已是第二轮调度：主要路由已被上方确定性守门短路，完整版中相关规则
+    # 对 LLM 已属冗余，继续灌输会干扰其判断，故改用精简 prompt（同时顺带减少 token）
     if agent_outputs:
         prompt = SUPERVISOR_PROMPT_MINIMAL
     else:

@@ -36,7 +36,7 @@ class ProjectHistory(BaseModel):
 # ---- 偏好 ----
 
 from ..preferences.models import (  # noqa: E402
-    LiteraturePref, WritingPref, ExperimentPref, ToolPref, PreferencesConfig,
+    LiteraturePref, WritingPref, ExperimentPref, PreferencesConfig,
 )
 
 
@@ -44,7 +44,6 @@ class UpdatePreferencesRequest(BaseModel):
     literature: LiteraturePref | None = None
     writing: WritingPref | None = None
     experiment: ExperimentPref | None = None
-    tool: ToolPref | None = None
 
 
 # ---- 原始偏好文件 ----
@@ -69,6 +68,8 @@ class ResumeRequest(BaseModel):
     # plan_options
     chosen_plan_id: str = Field(default="", description="用户选择的预制方案 ID")
     custom_plan_text: str = Field(default="", description="用户自定义的方案文本")
+    plan_title: str = Field(default="", description="所选预制方案的标题（证据采集）")
+    plan_type: str = Field(default="", description="所选方案的类别/类型（证据采集）")
     # query_clarification
     selected_direction: str = Field(default="", description="用户选择的澄清方向")
     use_original: bool = Field(default=False, description="是否按原始问题检索")

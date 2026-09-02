@@ -18,6 +18,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# 强制 UTF-8 输出：Windows 控制台默认 GBK，web 标题含 emoji 时 print 会崩
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -117,18 +122,26 @@ async def run_demo(question: str) -> None:
     _print_assessment(out, question)
 
 async def run_real(question: str, tools: list[str], project_id: str) -> None:
-    """真实链路：researcher 检索 → reviewer 评估。"""
+    """真实链路：researcher 检索 → reviewer 评估（带分段计时）。"""
+    import time
+    t0 = time.perf_counter()
     state = _build_state(question, project_id, tools)
     result = await researcher_node(state)
+    t1 = time.perf_counter()
+    print(f"\n[耗时] researcher 检索: {t1 - t0:.2f}s")
     sources = result.get("reference_sources", [])
     _print_sources(sources)
 
     if not sources:
         print("\n(无来源可评估，请检查检索结果或工具配置)")
+        print(f"[耗时] 总计: {time.perf_counter() - t0:.2f}s")
         return
 
     eval_state = {"reference_sources": sources}
     out = await assess_sources(eval_state, user_query=question)
+    t2 = time.perf_counter()
+    print(f"[耗时] reviewer 评审: {t2 - t1:.2f}s")
+    print(f"[耗时] 总计: {t2 - t0:.2f}s")
     _print_assessment(out, question)
 
 def main() -> None:

@@ -8,3 +8,7 @@ data/
 src/test/researcher_output_*.txt
 src/test/researcher_flow_*.txt
 src/test/retrieval_compare_*.txt
+src/test/full_flow_*.txt
+
+# 内部设计方案（不入库）
+plan/
